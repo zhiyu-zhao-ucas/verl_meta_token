@@ -12,7 +12,7 @@ export RAY_DEDUP_LOGS=0
 # -----
 TP=${1:-4}
 PROJECT_NAME=${PROJECT_NAME:-"verl_grpo_example_gsm8k_math"}
-EXP_NAME=trtllm-qwen2-7b-tp${TP}-8gpus${EXP_NAME_SUFFIX:+"-"}${EXP_NAME_SUFFIX}
+EXP_NAME=trtllm-qwen2.5-vl-3b-tp${TP}-8gpus${EXP_NAME_SUFFIX:+"-"}${EXP_NAME_SUFFIX}
 
 if [ $TP -eq 4 ]; then
     MAX_BATCH_SIZE=1024
@@ -24,7 +24,7 @@ fi
 # Data
 # -----
 DATADIR=${DATADIR:-$PWD/data}
-MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen2-7B-Instruct"}
+MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen2.5-VL-3B-Instruct"}
 
 GSM8K_TRAIN_PATH=${DATADIR}/gsm8k/train.parquet
 GSM8K_TEST_PATH=${DATADIR}/gsm8k/test.parquet
