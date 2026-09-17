@@ -111,16 +111,23 @@ def monkey_patch_compute_logits(model, vocab_size: int, banned_token_ids: Option
     unless a real image or video sits behind them. See `get_vision_placeholder_token_ids`.
     """
     original_compute_logits = model.compute_logits
+    # Built once and cached on the device: compute_logits runs on every decode step, and
+    # rebuilding the index there costs a host-to-device copy per step.
+    banned_index = torch.tensor(banned_token_ids, dtype=torch.long) if banned_token_ids else None
 
     def compute_logits(
         self,
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        nonlocal banned_index
+
         logits = original_compute_logits(*args, **kwargs)
         logits[..., vocab_size:] = float("-inf")
-        if banned_token_ids:
-            logits[..., banned_token_ids] = float("-inf")
+        if banned_index is not None:
+            if banned_index.device != logits.device:
+                banned_index = banned_index.to(logits.device)
+            logits.index_fill_(-1, banned_index, float("-inf"))
         return logits
 
     model.compute_logits = MethodType(compute_logits, model)
