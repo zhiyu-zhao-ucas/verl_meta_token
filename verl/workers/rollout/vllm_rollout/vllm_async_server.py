@@ -663,7 +663,10 @@ class vLLMHttpServer:
         if rejected is not None:
             return rejected
 
-        with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
+        with RLInsightLogger.trace_state(
+            "vllm_generate",
+            state_lane_id=ray.get_runtime_context().get_actor_name(),
+        ):
             generator = self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,

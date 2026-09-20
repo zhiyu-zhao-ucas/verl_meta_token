@@ -653,7 +653,10 @@ class SGLangHttpServer:
         if self.lora_as_adapter:
             generate_request.lora_path = SGLANG_LORA_NAME
 
-        with RLInsightLogger.trace_state("sglang_generate", state_lane_id=f"replica_{self.replica_rank}"):
+        with RLInsightLogger.trace_state(
+            "sglang_generate",
+            state_lane_id=ray.get_runtime_context().get_actor_name(),
+        ):
             output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
