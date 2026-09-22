@@ -186,26 +186,34 @@ class RolloutReplica(ABC):
         self.workers = worker_group.workers
         await self.launch_servers()
 
-    async def init_standalone(self):
-        """Init standalone rollout server, create new resource pool for this rollout."""
-        # create resource pool for this rollout
+    async def init_standalone(self, resource_pool: Optional[RayResourcePool] = None):
+        """Init standalone rollout server.
+
+        Args:
+            resource_pool: Existing pool to attach. If omitted, create a new
+                per-replica pool as before. Callers that already sliced a parent
+                pool (e.g. async-RL) pass the slice here so replica placement
+                stays under their ResourcePoolManager.
+        """
         self.rollout_mode = RolloutMode.STANDALONE
-        if self.is_reward_model:
-            resource_pool_name = f"rollout_pool_reward_{self.replica_rank}{self.name_suffix}"
-        elif self.is_teacher_model:
-            resource_pool_name = f"rollout_pool_teacher_{self.replica_rank}{self.name_suffix}"
-        else:
-            resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
-        resource_pool_spec = {
-            resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
-        }
-        resource_pool_manager = ResourcePoolManager(
-            resource_pool_spec=resource_pool_spec,
-            mapping=None,
-            max_colocate_count=2,
-        )
-        resource_pool_manager.create_resource_pool()
-        self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+        if resource_pool is None:
+            if self.is_reward_model:
+                resource_pool_name = f"rollout_pool_reward_{self.replica_rank}{self.name_suffix}"
+            elif self.is_teacher_model:
+                resource_pool_name = f"rollout_pool_teacher_{self.replica_rank}{self.name_suffix}"
+            else:
+                resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
+            resource_pool_spec = {
+                resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
+            }
+            resource_pool_manager = ResourcePoolManager(
+                resource_pool_spec=resource_pool_spec,
+                mapping=None,
+                max_colocate_count=2,
+            )
+            resource_pool_manager.create_resource_pool()
+            resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+        self.resource_pool = resource_pool
 
         # create worker group for this rollout
         if self.is_reward_model:
