@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exercise source-style batch sampling through the V1 client boundary."""
+"""Exercise V1 prompt loading and delta sampling through the V1 client boundary."""
 
 import asyncio
 import importlib.util
+import json
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -81,6 +82,70 @@ def test_batch_sample_v1_uncertainty_to_paired_mc():
     assert labels[1]["v_next"] == rollout["terminal_reward"]
     assert len(client.calls) == 4  # two unique prefixes, two samples each
     assert all(call["sampling_params"] == mc_config.sampling_config for call in client.calls)
+
+
+def test_v1_prompt_loader_uses_trainer_batches_and_chat_template(tmp_path):
+    pytest.importorskip("torchdata")
+    pytest.importorskip("datasets")
+    from omegaconf import OmegaConf
+
+    from examples.delta_critic.v1_prompts import load_v1_prompts
+
+    path = tmp_path / "prompts.jsonl"
+    path.write_text("".join(
+        json.dumps({
+            "prompt": [{"role": "user", "content": f"q{i}"}],
+            "reward_model": {"ground_truth": str(i)},
+            "data_source": "fixture",
+        }) + "\n" for i in range(3)
+    ))
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+            assert tokenize and add_generation_prompt
+            assert kwargs["enable_thinking"] is False
+            return [101] + [ord(char) for char in messages[0]["content"]] + [102]
+
+        def decode(self, ids, *, skip_special_tokens):
+            assert not skip_special_tokens
+            return ",".join(map(str, ids))
+
+    config = OmegaConf.create({
+        "data": {
+            "train_files": str(path), "val_files": str(path), "train_batch_size": 2,
+            "val_batch_size": 2, "dataloader_num_workers": 0,
+            "shuffle": False, "validation_shuffle": False, "seed": 42,
+            "prompt_key": "prompt", "filter_overlong_prompts": False,
+            "apply_chat_template_kwargs": {"enable_thinking": False},
+        },
+        "actor_rollout_ref": {"rollout": {"prompt_length": 3}},
+        "algorithm": {"filter_groups": {"enable": False}},
+        "trainer": {"v1": {"trainer_mode": "sync", "sampler": {"sync_refill_failed_groups": False}}},
+    })
+    tokenizer = Tokenizer()
+    train = load_v1_prompts(config, tokenizer=tokenizer, processor=None,
+                            hf_model_type=None, split="train")
+    validation = load_v1_prompts(config, tokenizer=tokenizer, processor=None,
+                                 hf_model_type=None, split="test")
+    assert [row["gold_answer"] for row in train] == ["0", "1"]  # V1 train drop_last
+    assert [row["gold_answer"] for row in validation] == ["0", "1", "2"]
+    assert train[0]["raw_prompt"] == [{"role": "user", "content": "q0"}]
+    assert train[0]["prompt_token_ids"] == [ord("q"), ord("0"), 102]  # V1 left cap
+    assert train[0]["prompt"] == "113,48,102"
+
+    from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+    from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
+
+    async def agent_loop_ids(messages):
+        loop = object.__new__(SingleTurnAgentLoop)
+        loop.loop = asyncio.get_running_loop()
+        loop.rollout_config = config.actor_rollout_ref.rollout
+        loop.continuous_token_builder = create_continuous_token_builder(
+            tokenizer, hf_model_type=None, chat_template_kwargs={"enable_thinking": False},
+        )
+        return await loop.ct_build_initial_tokens(messages)
+
+    assert train[0]["prompt_token_ids"] == asyncio.run(agent_loop_ids(train[0]["raw_prompt"]))
 
 
 def test_source_prompt_and_math_reward_parity():

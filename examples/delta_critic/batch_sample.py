@@ -91,7 +91,7 @@ def rollout_from_output(prompt: dict, prompt_ids: list[int], output, *, tokenize
             "entropy": -sum(float(item["prob"]) * math.log(max(float(item["prob"]), 1e-12)) for item in candidates),
             "top_candidates": candidates,
         })
-    return {
+    row = {
         "id": f"{split}-{prompt['prompt_id']}-{response_index}",
         "split": split,
         "prompt_id": prompt["prompt_id"],
@@ -110,6 +110,10 @@ def rollout_from_output(prompt: dict, prompt_ids: list[int], output, *, tokenize
         "actor_version": actor_version,
         "sampling_config": {key: value for key, value in sampling.items() if key != "reward"},
     }
+    if "raw_prompt" in prompt:
+        row["raw_prompt"] = prompt["raw_prompt"]
+        row["data_source"] = prompt["data_source"]
+    return row
 
 
 def _write_row(stream, row: dict) -> None:
@@ -152,34 +156,29 @@ async def sample_labeled_rollout(
 
 
 async def run(config: dict, *, split: str, output_dir: Path, prompts_jsonl: str | None,
-              limit: int | None, model_path: str, actor_version: str, mc_mode: str,
-              rollout_concurrency: int, mc_concurrency: int, gpu_memory_utilization: float) -> dict:
+              limit: int | None, model_path: str | None, actor_version: str | None, mc_mode: str,
+              rollout_concurrency: int, mc_concurrency: int, gpu_memory_utilization: float,
+              prompt_source: str = "verl_v1", verl_overrides: list[str] | None = None) -> dict:
     if rollout_concurrency < 1 or mc_concurrency < 1:
         raise ValueError("Concurrency must be positive")
     if not 0 < gpu_memory_utilization < 1:
         raise ValueError("gpu_memory_utilization must be in (0, 1)")
-    prompts = load_prompt_rows(config, split, prompts_jsonl=prompts_jsonl, limit=limit)
-    if not prompts:
-        raise ValueError("No prompts were loaded")
-    if split == "rank_eval":
-        train_prompts = load_prompt_rows(config, "train")
-        overlap = {p["prompt_id"] for p in prompts} & {p["prompt_id"] for p in train_prompts}
-        if overlap:
-            raise ValueError(f"rank_eval overlaps train on {len(overlap)} prompt IDs")
-    if len({row["prompt_id"] for row in prompts}) != len(prompts):
-        raise ValueError("Duplicate prompt_id in input split")
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
     generation, mc_config = sampling_settings(config, mc_mode)
-    mc_config = replace(mc_config, actor_version=actor_version)
     import ray
     from hydra import compose, initialize_config_dir
-    from transformers import AutoTokenizer
     from verl.workers.rollout.llm_server import LLMServerManager
 
     with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
-        verl_config = compose(config_name="ppo_trainer")
+        verl_config = compose(config_name="ppo_trainer", overrides=verl_overrides or [])
     verl_config.trainer.n_gpus_per_node = 1
     verl_config.trainer.nnodes = 1
-    verl_config.actor_rollout_ref.model.path = model_path
+    if model_path is not None:
+        verl_config.actor_rollout_ref.model.path = model_path
+    model_path = str(verl_config.actor_rollout_ref.model.path)
+    actor_version = actor_version or model_path
+    mc_config = replace(mc_config, actor_version=actor_version)
     rollout_config = verl_config.actor_rollout_ref.rollout
     rollout_config.name = "vllm"
     rollout_config.mode = "async"
@@ -192,15 +191,49 @@ async def run(config: dict, *, split: str, output_dir: Path, prompts_jsonl: str 
     rollout_config.load_format = "auto"
     rollout_config.skip_tokenizer_init = False
     rollout_config.dtype = str(config["model"].get("dtype", "auto"))
-    rollout_config.max_model_len = int(config["model"]["max_model_len"])
-    rollout_config.prompt_length = int(config["model"]["max_model_len"])
     rollout_config.response_length = int(generation["max_tokens"])
     rollout_config.seed = int(config.get("seed", 42))
     rollout_config.gpu_memory_utilization = gpu_memory_utilization
     rollout_config.standalone_gpu_memory_utilization = gpu_memory_utilization
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, trust_remote_code=bool(config["model"].get("trust_remote_code", True))
-    )
+    if prompt_source == "verl_v1":
+        if prompts_jsonl is not None:
+            raise ValueError("Use data.train_files/data.val_files in --verl-override for V1 prompts")
+        if split == "rank_eval":
+            raise ValueError("rank_eval is only defined by the value_model prompt source")
+        if (rollout_config.multi_turn.enable
+                or rollout_config.agent.default_agent_loop != "single_turn_agent"
+                or rollout_config.agent.agent_loop_config_path is not None):
+            raise ValueError("V1 prompt parity requires the built-in single_turn_agent without multi-turn tools")
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.config.model import HFModelConfig
+        from .v1_prompts import load_v1_prompts
+
+        model_config = omega_conf_to_dataclass(verl_config.actor_rollout_ref.model, HFModelConfig)
+        tokenizer = model_config.tokenizer
+        prompts = load_v1_prompts(
+            verl_config, tokenizer=tokenizer, processor=model_config.processor,
+            hf_model_type=model_config.hf_config.model_type, split=split, limit=limit,
+        )
+    elif prompt_source == "value_model":
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=bool(config["model"].get("trust_remote_code", True))
+        )
+        rollout_config.max_model_len = int(config["model"]["max_model_len"])
+        rollout_config.prompt_length = int(config["model"]["max_model_len"])
+        prompts = load_prompt_rows(config, split, prompts_jsonl=prompts_jsonl, limit=limit)
+        if split == "rank_eval":
+            train_prompts = load_prompt_rows(config, "train")
+            overlap = {p["prompt_id"] for p in prompts} & {p["prompt_id"] for p in train_prompts}
+            if overlap:
+                raise ValueError(f"rank_eval overlaps train on {len(overlap)} prompt IDs")
+    else:
+        raise ValueError(f"Unknown prompt source: {prompt_source}")
+    if not prompts:
+        raise ValueError("No prompts were loaded; V1 train loading drops incomplete batches")
+    if len({row["prompt_id"] for row in prompts}) != len(prompts):
+        raise ValueError("Duplicate prompt_id in input split")
     output_dir.mkdir(parents=True, exist_ok=True)
     filenames = {
         "rollouts": f"rollouts_{split}_regen.jsonl",
@@ -224,7 +257,9 @@ async def run(config: dict, *, split: str, output_dir: Path, prompts_jsonl: str 
             for start in range(0, len(prompts), rollout_concurrency):
                 jobs = []
                 for prompt in prompts[start:start + rollout_concurrency]:
-                    prompt_ids = tokenizer.encode(prompt["prompt"], add_special_tokens=False)
+                    prompt_ids = prompt.get("prompt_token_ids")
+                    if prompt_ids is None:
+                        prompt_ids = tokenizer.encode(prompt["prompt"], add_special_tokens=False)
                     if not prompt_ids:
                         raise ValueError(f"Empty prompt tokenization for {prompt['prompt_id']}")
                     for response_index in range(int(config["smoke"]["responses_per_prompt"])):
@@ -261,6 +296,9 @@ def main() -> None:
     parser.add_argument("--config", default="examples/delta_critic/config_sampling_qwen3_8b.yaml")
     parser.add_argument("--split", choices=["train", "test", "rank_eval"], default="train")
     parser.add_argument("--prompts-jsonl", help="Override the configured prompt dataset with a JSONL file")
+    parser.add_argument("--prompt-source", choices=["verl_v1", "value_model"], default="verl_v1")
+    parser.add_argument("--verl-override", action="append", default=[],
+                        help="Hydra override for ppo_trainer, repeatable (e.g. data.train_files=/path/train.parquet)")
     parser.add_argument("--limit", type=int, help="Override the configured prompt count")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--model-path", help="Override model.actor_model, e.g. with a local snapshot")
@@ -275,13 +313,20 @@ def main() -> None:
 
     with open(args.config, encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
-    model_path = args.model_path or config["model"]["actor_model"]
-    actor_version = args.actor_version or model_path
+    has_v1_model_override = any(
+        override.lstrip("+").startswith("actor_rollout_ref.model.path=")
+        for override in args.verl_override
+    )
+    model_path = args.model_path or (
+        None if args.prompt_source == "verl_v1" and has_v1_model_override else config["model"]["actor_model"]
+    )
+    actor_version = args.actor_version
     result = asyncio.run(run(
         config, split=args.split, output_dir=Path(args.output_dir),
         prompts_jsonl=args.prompts_jsonl, limit=args.limit, model_path=model_path,
         actor_version=actor_version, mc_mode=args.mc_mode,
         rollout_concurrency=args.rollout_concurrency, mc_concurrency=args.mc_concurrency,
+        prompt_source=args.prompt_source, verl_overrides=args.verl_override,
         gpu_memory_utilization=(args.gpu_memory_utilization if args.gpu_memory_utilization is not None
                                 else float(config["model"].get("gpu_memory_utilization", 0.9))),
     ))

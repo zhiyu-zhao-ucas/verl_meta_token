@@ -1,30 +1,62 @@
 # Delta data contract (migration step 1)
 
-## Batch sampling with the verl V1 server
+## Batch sampling with verl V1 prompts and server
 
-The batch sampler runs prompt loading, rollout generation, uncertainty state
-selection, MC labels, and JSONL export through the Ray-managed V1 vLLM server:
+The default prompt path uses the same `ppo_trainer` data configuration,
+`create_rl_dataset`, `StatefulDataLoader`, train sampler, and Continuous Token
+builder as V1 PPO/GRPO single-turn rollout. Supply the same `data.*` overrides
+used for PPO/GRPO. For example, with a verl-formatted JSONL or Parquet file
+containing `prompt` chat messages and `reward_model.ground_truth`:
 
 ```bash
 python -m examples.delta_critic.batch_sample \
   --config examples/delta_critic/config_sampling_qwen3_8b.yaml \
   --split train \
+  --verl-override data.train_files=/path/to/train.parquet \
+  --verl-override data.val_files=/path/to/test.parquet \
+  --verl-override data.train_batch_size=32 \
+  --verl-override data.shuffle=True \
+  --verl-override data.seed=42 \
+  --verl-override data.max_prompt_length=2048 \
+  --verl-override +data.apply_chat_template_kwargs.enable_thinking=False \
   --output-dir /path/to/new/delta_samples
 ```
 
+Use `data.val_files` with `--split test`; `data.prompt_key`, custom dataset,
+filtering, train/validation shuffle, sampler seed, worker count, and batch
+sizes also come from the V1 Hydra config. The train loader drops the last
+incomplete batch, as V1 does. `--limit N` takes the first N prompts in loader
+order. The recorded `raw_prompt` keeps the source chat messages, while
+`prompt_token_ids` are the actual token IDs passed to the server after the
+same chat template and left cap used by `SingleTurnAgentLoop`. Pass the same
+model path with `--model-path` if the PPO/GRPO run uses a local checkpoint.
+This delta collector handles text-only, single-turn prompts with
+`reward_model.ground_truth`; tool and multimodal requests need their V1
+AgentLoop paths to be collected separately.
+
+For the earlier source-style DeepMath text prompts, select that source
+explicitly:
+
+```bash
+python -m examples.delta_critic.batch_sample \
+  --prompt-source value_model \
+  --config examples/delta_critic/config_sampling_qwen3_8b.yaml \
+  --split train \
+  --output-dir /path/to/source_style_samples
+```
+
 Run from the repository root in an environment with compatible Ray, vLLM,
-`datasets`, `math-verify`, and CUDA dependencies. The default config matches
+`datasets`, `torchdata`, `math-verify`, and CUDA dependencies. The delta config matches
 the **effective** sampling settings in
 `value_model/delta_value_llm_exp/config_qwen3_8b_densecritic_aligned_sweeps.yaml`:
-Qwen3-8B, 2048 DeepMath train prompts, one rollout each, 2048 maximum response
+Qwen3-8B, 2048 DeepMath train prompts in source mode, one rollout each, 2048 maximum response
 tokens, temperature 0.7, top-p 0.95, top-20 candidate logprobs, up to 64
 selected states spaced by 32 tokens, top-mass 0.8, and 32 MC continuations
 with temperature 0.7, top-p 0.95, and 2048 maximum new tokens. The default
 MC mode is `prefix_only`, matching the source MC script's default. For the
 `ours_local` paired label path, add `--mc-mode paired_next_state`. To sample
-the configured test or rank-eval split, use `--split test` or
-`--split rank_eval`. `--prompts-jsonl` and `--limit` support a small input
-check while keeping the other settings.
+the test split, use `--split test`; `--split rank_eval` applies only to source
+mode. `--prompts-jsonl` applies only to source mode; `--limit` works with both.
 
 The command writes `rollouts_<split>_regen.jsonl`,
 `states_<split>.jsonl`, and `mc_labels_<split>.jsonl`. An existing final
@@ -35,9 +67,11 @@ behavior-logprob provenance. The V1 backend returns top-k candidates in
 `TokenOutput.extra_fields["delta_top_logprobs"]` only when this sampler
 requests them; normal rollout responses keep their existing payload.
 
-The data and selection formulas match the source, but generated token streams
-are not guaranteed identical. The source calls synchronous vLLM with string
-prompts and requests all 32 MC samples in one `SamplingParams(n=32)` call.
+The state selection and MC formulas match the source, but the default V1
+prompt source uses PPO/GRPO chat messages, dataset sampling, and chat-template
+tokenization. Its prompt strings and token IDs therefore differ from the
+source's raw DeepMath text prompt path. The source calls synchronous vLLM with
+string prompts and requests all 32 MC samples in one `SamplingParams(n=32)` call.
 This sampler sends token IDs to Ray-managed V1 vLLM, runs one asynchronous
 request per MC continuation, and can overlap requests. The source MC path
 decodes and retokenizes prefixes; this path sends the original token IDs.
@@ -46,8 +80,8 @@ It decodes V1 outputs locally because `TokenOutput` does not carry vLLM
 version can therefore change exact samples. The source YAML declares rollout
 `repetition_penalty` and `stop`, but its rollout script does not pass them
 to `SamplingParams`; the equivalent config uses the effective parameters.
-The sampler uses the current V1 server but does not enqueue data into
-TransferQueue or train a critic.
+The sampler uses the V1 dataloader ordering and server but does not enqueue
+data into TransferQueue, apply PPO/GRPO group filtering, or train a critic.
 
 This package establishes the `value_model` token-delta semantics. It imports
 existing token IDs and MC rows and now accepts unpadded V1 AgentLoop/TransferQueue
