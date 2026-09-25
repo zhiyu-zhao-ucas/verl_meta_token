@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -620,7 +621,18 @@ class vLLMHttpServer:
         assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        delta_top_logprobs = sampling_params.pop("delta_top_logprobs", None)
+        sampled_logprobs = sampling_params.pop("logprobs", False)
+        if delta_top_logprobs is not None:
+            if (
+                isinstance(delta_top_logprobs, bool)
+                or not isinstance(delta_top_logprobs, int)
+                or delta_top_logprobs <= 0
+            ):
+                raise ValueError("delta_top_logprobs must be a positive integer")
+            sampling_params["logprobs"] = delta_top_logprobs
+        else:
+            sampling_params["logprobs"] = 0 if sampled_logprobs else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
@@ -638,7 +650,10 @@ class vLLMHttpServer:
         # detokenized text to match, so only skip when neither is used (`stop_token_ids`
         # is unaffected). Teacher requests already set detokenize=False upstream, so this
         # setdefault leaves them untouched.
-        if not sampling_params.get("stop") and not sampling_params.get("bad_words"):
+        if delta_top_logprobs is not None:
+            # Source uncertainty rows retain vLLM's decoded candidate tokens.
+            sampling_params.setdefault("detokenize", True)
+        elif not sampling_params.get("stop") and not sampling_params.get("bad_words"):
             sampling_params.setdefault("detokenize", False)
 
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
@@ -724,6 +739,19 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+        if delta_top_logprobs is not None:
+            top_rows = []
+            for top in final_res.outputs[0].logprobs:
+                candidates = []
+                for token_id, entry in top.items():
+                    value = float(entry.logprob)
+                    candidates.append({
+                        "token_id": int(token_id), "logprob": value,
+                        "prob": float(math.exp(value)),
+                        "token": getattr(entry, "decoded_token", None),
+                    })
+                top_rows.append(sorted(candidates, key=lambda item: item["prob"], reverse=True))
+            extra_fields["delta_top_logprobs"] = top_rows
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -731,6 +759,7 @@ class vLLMHttpServer:
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
+        extra_fields["finish_reason"] = finish_reason
         if finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):

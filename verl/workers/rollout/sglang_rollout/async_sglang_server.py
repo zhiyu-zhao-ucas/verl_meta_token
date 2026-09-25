@@ -669,7 +669,7 @@ class SGLangHttpServer:
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {"global_steps": self.global_steps, "finish_reason": finish_reason}
         if prompt_logprobs is not None:
             _extract_prompt_logprobs_sglang(
                 meta_info=meta_info,
