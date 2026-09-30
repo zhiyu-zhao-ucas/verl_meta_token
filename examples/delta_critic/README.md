@@ -59,7 +59,10 @@ the test split, use `--split test`; `--split rank_eval` applies only to source
 mode. `--prompts-jsonl` applies only to source mode; `--limit` works with both.
 
 The command writes `rollouts_<split>_regen.jsonl`,
-`states_<split>.jsonl`, and `mc_labels_<split>.jsonl`. An existing final
+`states_<split>.jsonl`, `mc_labels_<split>.jsonl`, and
+`continuations_<split>.jsonl`. The continuation file keeps one row per MC
+sample with the state and continuation IDs, token IDs, decoded text, and reward;
+the MC label also keeps the 32 individual rewards. An existing final
 output file causes an error to prevent accidental replacement. Incomplete
 temporary files are not promoted if a run fails. Rows retain the source's
 identifiers, token fields, labels, and split, with added actor/version and
@@ -72,8 +75,18 @@ prompt source uses PPO/GRPO chat messages, dataset sampling, and chat-template
 tokenization. Its prompt strings and token IDs therefore differ from the
 source's raw DeepMath text prompt path. The source calls synchronous vLLM with
 string prompts and requests all 32 MC samples in one `SamplingParams(n=32)` call.
-This sampler sends token IDs to Ray-managed V1 vLLM, runs one asynchronous
-request per MC continuation, and can overlap requests. The source MC path
+This sampler sends token IDs to Ray-managed V1 vLLM. Its default native mode
+uses vLLM's `n` sampling and returns every completion through
+`TokenOutput.extra_fields["delta_mc_token_ids"]`. `--mc-concurrency` limits the
+number of MC sequences in flight (default 16), so 32 samples per state use two
+`n=16` requests by default; set it to 32 for one `n=32` request per state.
+Set `--mc-native-batch-size 8 --mc-concurrency 32` to admit four state requests
+at once while keeping at most 32 MC sequences in flight.
+`--mc-sampling-mode requests` keeps the separate-request path for comparison.
+Rollout generation uses
+`--rollout-concurrency` workers (default 8); finished rollouts enter a bounded
+MC queue immediately, and `math_verify` scoring overlaps GPU generation. JSONL
+rows may be written in completion order. The source MC path
 decodes and retokenizes prefixes; this path sends the original token IDs.
 It decodes V1 outputs locally because `TokenOutput` does not carry vLLM
 `completion.text`. RNG order, tokenization at prefix boundaries, and backend
@@ -85,7 +98,9 @@ data into TransferQueue, apply PPO/GRPO group filtering, or train a critic.
 
 This package establishes the `value_model` token-delta semantics. It imports
 existing token IDs and MC rows and now accepts unpadded V1 AgentLoop/TransferQueue
-output rows. It does not train a model, load a checkpoint, or modify the V1 trainer.
+output rows. It includes standalone scalar-delta training, checkpoint import,
+and frozen scoring paths. It does not change the default V1 PPO/GRPO policy-loss
+path or core trainer loop.
 
 The implementation lives under `examples/` because this checkout's `recipe/` is
 an uninitialized git submodule. Putting files there would not track them in the
@@ -219,19 +234,33 @@ Positions for padding are `-1`; gather only positions enabled by validity masks.
 - Token masks in this contract are binary. Fractional sample weights, value
   targets, centering, distributional losses and hybrid terminal-composition
   auxiliary targets are outside step 1.
-- **Window policy remains undecided.** Helpers provide untruncated mappings and
-  padding only. A too-small padding width is not a truncation mode. The source's
-  whole-rollout training tail window differs from its selected-prefix inference
-  tail window, and the `verl-agent` full-action approach differs too. No new
-  production max length or rejection policy has been chosen here.
-- **Checkpoint acceptance and normalization metadata formats remain undecided.**
-  No checkpoint reader/worker validator is added. Numerical `none` normalization
-  is supported explicitly, but source `mean/std=None` metadata has not been
-  converted to the other repository's format.
+- Source `.pt` imports accept only scalar `target_type=delta`, `output_dim=1`,
+  `local_td0` or `hybrid_terminal_composition`, MSE or balanced MSE,
+  response/selected-state masks, and the supported delta label modes.
+  Distributional heads, value centering, target networks, and other objectives
+  fail validation. The importer preserves source metadata, step, backbone and
+  tokenizer identity, value-layer index, source path, and SHA256. Legacy `.pt`
+  files initialize weights only; they do not contain enough state to resume.
+- Disabled target normalization keeps source `mean/std=None` metadata and scores
+  numerically as `mean=0, std=1`. Enabled statistics must be finite with positive
+  population std. Converted artifacts also record a tokenizer fingerprint and
+  checksum of the portable model weights.
+- Window behavior is explicit. Imported source checkpoints use `legacy_tail`,
+  keeping the rightmost checkpoint-sized window of each selected prefix and
+  recording its start index. New training artifacts use their stored `full`
+  context cap and reject selected prefixes beyond it. `--scoring-max-length`
+  may expand that cap; score metadata records the change.
+- `FrozenDeltaWorker` reads unpadded TransferQueue `prompts`, `responses`, and
+  selected response indices. It writes normalized and raw delta vectors plus
+  the selected-signal mask, preserving each row key and jagged response length.
+  Indices may be supplied directly or stored in `selected_token_indices`. The
+  V1 engine path requires a forward-only `TrainingWorker` initialized from the
+  same artifact and without an optimizer; the standalone torch path supports
+  parity checks and CLI scoring. Neither path changes the default V1 PPO/GRPO
+  policy loss.
 - `verl-agent` reads the final token of a whole action and uses action/batch
   normalization. The approved path instead retains multiple selected states,
-  source segment broadcast, and the completed critic-driven run's train-token
-  standardization. No worker or core trainer code is changed.
+  source segment broadcast, and train-token standardization.
 
 ## New rollout and MC collection
 
@@ -298,6 +327,136 @@ The cached Qwen3-8B run passed twice with 16 response tokens, two selected
 states and two MC samples per state. The migration plan records the exact
 snapshot and temporary environment workaround used for that run.
 
+## Critic checkpoint import and frozen scoring
+
+Convert a source scalar `.pt` file into the portable artifact format before
+scoring it. Import validates the model/head shape, training semantics,
+normalization metadata, backbone/tokenizer identity, hidden-state index, and
+training context length.
+
+```bash
+python -m examples.delta_critic.checkpoint /path/to/critic.pt /path/to/critic-artifact
+python -m examples.delta_critic.score \
+  --checkpoint /path/to/critic-artifact \
+  --rollouts /path/to/rollouts.jsonl \
+  --selected /path/to/selected-states.jsonl \
+  --output /path/to/scored.jsonl \
+  --device cuda --microbatch 8
+```
+
+The selected file needs `rollout_id` and `token_index`; scoring does not read MC
+values. For TransferQueue inference, construct `FrozenDeltaWorker` from the same
+portable artifact and call `score_transfer_queue(meta)`. To use the V1 engine
+path, pass an initialized forward-only `TrainingWorker` created with that
+artifact as its initial weights. Both paths read each selected response prefix
+through `P+t` and restore scores to original row and token order.
+
+## Scalar critic training with V1/FSDP2
+
+`examples.delta_critic.train` uses a dedicated `model_type=delta_scalar`
+TrainingWorker and FSDP2 engine. The backbone follows `dtype` (BF16 by default)
+while the biased scalar head remains FP32. `local_td0` and
+`hybrid_terminal_composition` are supported. The hybrid objective fits terminal
+statistics on training continuations alone and requires full eligible
+continuation coverage unless a continuation budget is explicitly configured.
+
+New configs leave `max_length: null`; the trainer resolves it from the loaded
+backbone's native `max_position_embeddings` (Qwen3-8B: 40960). Inputs over the
+resolved cap are rejected.
+
+Collate right-pads the global batch to its longest row, but each micro-batch is
+then trimmed to **its own** longest row before the forward, so padding columns
+are only computed when a micro-batch really contains rows of different lengths.
+At `--microbatch 1` that means no padding at all, which is what the source
+trainer's `batch_size=1` collate produced; running every micro-batch at the
+global batch width cost about 1.7x extra forward and backward work on this data.
+Sequence parallel size stays 1 and the LM fused-forward kernels stay disabled.
+
+The attention backend comes from `attention_implementation` and can be
+overridden per run without editing a config:
+
+```bash
+torchrun --standalone --nproc_per_node=1 -m examples.delta_critic.train \
+  --config examples/delta_critic/config_train_qwen3_8b.yaml \
+  --attention-implementation flash_attention_2 ...
+```
+
+`sdpa` is the default and is what the source critic runs used. `flash_attention_2`
+additionally requires the `flash-attn` package, which is not installed by
+default; without it the run fails at model load with an explicit ImportError.
+Do not interpret the old 2048-token source-run length as the default for new runs.
+
+The data split must map every rollout ID to exactly one of `train` or `eval`.
+`--global-batch` and `--max-steps` are required so the update count and linear
+learning-rate schedule are explicit. Every real row has equal weight in an
+optimizer update, including rows with zero supervised tokens; gradient
+accumulation and DP partitioning do not change that logical row mean. Synthetic
+padding rows are excluded. Start from the repository root, for example:
+
+```bash
+torchrun --standalone --nproc_per_node=1 -m examples.delta_critic.train \
+  --config examples/delta_critic/config_train_qwen3_8b.yaml \
+  --rollouts /data/rollouts.jsonl --labels /data/labels.jsonl \
+  --split /data/split.json --output /runs/delta-local \
+  --global-batch 1 --max-steps 100 --microbatch 1
+```
+
+For hybrid training, use `config_train_hybrid_qwen3_8b.yaml` and add
+`--continuations /data/continuations.jsonl`. A portable source `.pt` import or
+completed training artifact can be supplied with `--initialize` to load weights
+and start a fresh optimizer/data stream. Exact resume instead uses `--resume`
+with a completed training checkpoint; it restores model, optimizer, scheduler,
+step, row-order cursor, and RNG state, and checks that data, statistics,
+configuration, effective batch, and DP topology match. Checkpoints include a
+portable scoring artifact plus V1 engine state. Evaluation reports TD and
+terminal losses, real/supervised row and token coverage, and data provenance.
+
+The small acceptance harness exercises a real tiny Qwen3 through the V1 worker,
+including save/resume next-step equivalence, microbatch/DP scaling, and
+TransferQueue scoring:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python examples/delta_critic/smoke_training.py \
+  --output /tmp/delta-critic-smoke
+```
+
+It is a plumbing test, not an 8B training or throughput benchmark. Dynamic
+remove-padding, sequence parallelism, fused-forward optimization, actor update,
+and actor/critic alternation remain follow-up work.
+
+## Delta critic evaluation against MC labels
+
+`examples.delta_critic.evaluate` ports the delta path of the source
+`06_eval_token_delta_unified.py`. It scores every selected MC state at its own
+`P+t` position and reports the source's four metric blocks: raw
+`delta_regression`, the per-response and per-query z-scored
+`normalized_delta_regression`, the three-class `discrete` block, and
+`delta_sign_diagnostics`. Predictions are denormalized with the checkpoint's own
+target statistics, so every reported number is in raw reward units.
+
+```bash
+python -m examples.delta_critic.evaluate \
+  --checkpoint /runs/delta-local/step_00001120 \
+  --rollouts /data/rollouts_rank_eval_regen.jsonl \
+  --labels /data/mc_labels_rank_eval.jsonl \
+  --output /runs/delta-local/eval_rank_eval.json \
+  --rows-output /runs/delta-local/eval_rows.jsonl \
+  --split rank_eval --microbatch 8
+```
+
+`--class-margin` defaults to the source's `1/32`; deltas inside the margin count
+as `neutral` for both ground truth and predictions, and a delta target is
+anchored to the rollout's `terminal_reward` when the state is the last selected
+one. The source's value, distributional, anchored-value and policy-gradient
+blocks are out of migration scope and are not reproduced.
+
+The reported `gt_delta` is always
+`V(next selected state, or terminal reward) - V(current selected state)`. That
+matches the source, whose selected-state evaluation has no label-mode branch in
+either eval path — so for a checkpoint trained with `paired_next_state` this is
+a *different quantity* from the training target, and only `selected_segment`
+models are evaluated against the target they were trained on.
+
 ## Source references and verification
 
 Paths below are relative to the `value_model` checkout, under
@@ -314,13 +473,13 @@ Paths below are relative to the `value_model` checkout, under
 Run CPU golden tests without models or an external checkout:
 
 ```bash
-python -m pytest -q tests/examples/delta_critic
+python -m pytest -q tests/special_standalone/delta_critic
 ```
 
 To also compare against the actual source functions:
 
 ```bash
-VALUE_MODEL_ROOT=/path/to/value_model python -m pytest -q tests/examples/delta_critic
+VALUE_MODEL_ROOT=/path/to/value_model python -m pytest -q tests/special_standalone/delta_critic
 ```
 
 The optional differential test imports the source's dependency-free policy

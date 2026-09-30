@@ -21,9 +21,10 @@ Last updated: 09/30/2026
 | --- | --- | --- | --- |
 | Delta 读取与传播 | 多个 selected token 位置读取；learned delta 广播到对应 segment | 每行 action 的最后有效 token 读取，广播到整个 action | 用户已指定与 `value_model` 一致 |
 | Policy advantage 归一化 | critic 驱动 final 运行采用训练集广播后 token 的标准化 | 支持当前 batch 的 action 标准化、仅缩放等 | 按用户要求核对实际运行记录；提供 `value_model_final_grpo` 标准化配置 |
-| Checkpoint 接受范围 | 支持 `selected_state` 等监督配置及多种目标 | 当前 frozen worker 只接受其中一部分配置 | 待用户决定支持范围；未实现 reader/validator |
-| 未归一化 checkpoint 元数据 | `none` 可以保存 `mean/std=None` | 参考 worker 要求其支持的 identity/standardize 格式 | 待用户决定兼容规则；数值恒等变换已支持，metadata 转换未实现 |
-| 超长输入上下文 | critic 训练取完整 rollout 尾窗口；逐状态推理取 selected prefix 尾窗口 | 对完整 action 行截取尾窗口 | 待用户决定；当前仅提供无截断位置映射及 padding |
+| Checkpoint 接受范围 | 支持 `selected_state` 等监督配置及多种目标 | 当前 frozen worker 只接受其中一部分配置 | 已定为首批支持 `local_td0`/`hybrid_terminal_composition` + `mse`/`nonzero_balanced_mse` + `selected`/`response` 监督 + `selected_segment`/`paired_next_state` 标签；其他 head/objective 由导入器明确拒绝 |
+| 未归一化 checkpoint 元数据 | `none` 可以保存 `mean/std=None` | 参考 worker 要求其支持的 identity/standardize 格式 | 已定：接受 `None` 并按恒等变换（`mean=0,std=1`）计算，保留原始元数据；启用标准化却缺统计量则报错 |
+| 超长输入上下文 | critic 训练取完整 rollout 尾窗口；逐状态推理取 selected prefix 尾窗口 | 对完整 action 行截取尾窗口 | 已定：新训练用 backbone 原生上限（Qwen3-8B 为 40960）、完整保留、超限显式报错；旧 checkpoint 复现仍用其原始 2048 及原版各自的窗口规则 |
+| critic loss | sweep 里有 `delta_resp_mse`（`mse`）与 `delta_resp_bal`（`nonzero_balanced_mse`）两个方法；**实际运行的 delta critic 与源评测报告里全部 4 个 delta 模型都是 `nonzero_balanced_mse`**（`seed_42_delta_resp_bal` 日志：`loss_type=nonzero_balanced_mse; balance_active=True`） | 不支持该命名 | 已定：**默认 `nonzero_balanced_mse`**；plain `mse` 仅保留为 `config_train_qwen3_8b_mse.yaml` 对照变体。objective 目前支持 `local_td0` 与 `hybrid_terminal_composition`，hybrid/lambda 方向可继续，`composition`/`bootstrap`/`target_bootstrap` 等先不做 |
 
 代码位置从原计划的 `recipe/delta_critic/` 调整为 `examples/delta_critic/`：当前仓库的 `recipe/` 是独立 Git 子模块，在其中新增文件不能直接纳入根仓库的 `delta` 分支。子模块配置未修改。
 
@@ -65,7 +66,11 @@ Last updated: 09/30/2026
 
 ### 第 3 部分：delta 模型、loss 与 checkpoint
 
-**状态：未实现。**
+**状态：模型、loss、V1/FSDP2 训练入口、旧 `.pt` 导入与保存恢复已实现并通过 CPU 源差分测试；单卡真实 FSDP2 训练已跑通，两卡复跑因 8 张卡被数据采集占满而未完成。**
+
+当前实现：`scalar_model.py` 用源等价 backbone（`backbone.*` + 带 bias 的 FP32 `scalar_head.*`、`value_layer` 原下标、移除 LM head、原生上下文检查）提供模型；`training_data.py` 负责原生长度解析、右 padding collate、hybrid suffix 位置与连续性覆盖率统计；`scalar_loss.py` 提供源 MSE/balanced MSE 与 hybrid loss，并按「真实数据行」而非分布式补齐行计算分母；`engine.py` 注册 `model_type=delta_scalar` 的 FSDP2 engine，复用 V1 `TrainingWorker` 的执行、优化器与 checkpoint 能力，并显式拒绝 remove-padding、SP>1、fused kernels/LoRA/Liger/QAT；`train.py` 提供 torchrun 入口、数据指纹与语义变更记录、`--initialize`（仅权重）与 `--resume`（精确续训）两条路径。首版按用户确认执行：动态右 padding、关闭 remove-padding、`SP=1`、关闭 LM 专用 fused-forward 开关。
+
+验证进展：CPU 源差分覆盖 target、collate、两类 loss、hybrid loss、反归一化与梯度（详见第 7 节）。真实 FSDP2 侧，上次会话已完成单卡 hybrid 训练、`--stop-after` 后恢复的最终权重逐位一致、以及 microbatch=1 与 2 的对照（最大权重差约 `5.96e-08`）；两卡运行时发现 checkpoint 保存竞争——非 0 rank 用自己查目录的方式判断是否覆盖，而 rank 0 已建好目录，导致合法保存在两卡上被误判为覆盖。修复方式是把「预留 step 目录」交给 rank 0 独占并广播结论。该修复本次补了确定性多进程回归测试，但**两卡复跑尚未执行**。
 
 参考源文件：`05_train_token_scalar_model_accelerate_local.py`、`modeling_token_scalar.py`。
 
@@ -83,7 +88,11 @@ Last updated: 09/30/2026
 
 ### 第 4 部分：冻结 critic 推理 worker
 
-**状态：未实现。**
+**状态：导入器、冻结 worker 与 TransferQueue 读写适配已实现并通过 CPU 源差分测试；真实 V1 GPU worker 运行尚未验证。**
+
+当前实现：`checkpoint.py` 的 `import_legacy` 校验源 `.pt` 的 `target_type`/`output_granularity`/`step`、head 维度、objective、loss、监督 mask、标签模式、backbone/tokenizer 身份、`value_layer` 与训练长度，保留源元数据与哈希，并对 distributional、value centering、target-network 等未支持配置显式报错；导入后的 artifact（`metadata.json` + `model.pt`）带 `weights_sha256`、`stats_version` 和归一化/terminal 统计校验。`score.py` 的 `FrozenDeltaWorker` 用 `eval()` + `torch.inference_mode()`、不建 optimizer，按 selected prefix 长度分桶后恢复原始行序，对每个 selected token 读取 `P+t` 并写出 response 对齐的 `delta_pred_normalized`、`delta_pred_raw`、`critic_signal_mask` 及 checkpoint/统计版本/窗口信息；未评分位置填零且 mask 为零，真实零预测的 mask 仍为一。窗口按第 2 节决定分为 `full`（新训练）与 `legacy_tail`（旧 checkpoint 复现）两种策略，显式扩大旧 checkpoint 评分窗口会记录为语义变化。
+
+验证进展：导入器元数据校验、评分重排与冻结、零预测仍为 signal、内存 TransferQueue 往返（真实安装包，CPU）以及源模型/prefix 差分均已通过。V1 `infer_batch` 目前只有 fake-worker 契约测试，真实 forward-only GPU worker 尚未运行；生产规模旧 `.pt` 权重也未做实际 forward 对照。
 
 工程参考：`verl-agent/recipe/delta_critic/critic_core.py`、`critic_worker.py`。
 
@@ -248,23 +257,165 @@ state_advantage_scope: selected_token_to_before_next_selected_state
 | [smoke_v1_gpu.py](../examples/delta_critic/smoke_v1_gpu.py) | 单 GPU 真模型 V1 rollout → MC → 契约手动验收脚本 |
 | V1 vLLM/SGLang async server | 在 `TokenOutput.extra_fields` 保留原始 `finish_reason`；vLLM 按请求返回 top-k 候选 |
 | [README.md](../examples/delta_critic/README.md) | 数据接口语义、使用示例、实际运行出处及未决范围 |
-| [test_contracts.py](../tests/examples/delta_critic/test_contracts.py) | CPU golden、输入校验、边界行为及可选源实现差分测试 |
-| [test_collection.py](../tests/examples/delta_critic/test_collection.py) | V1 行导出、状态选择、模拟 MC 服务端到端及失败路径 |
-| [test_batch_sample.py](../tests/examples/delta_critic/test_batch_sample.py) | 模拟 V1 top-k → uncertainty → paired MC，以及源配置/prompt/reward 差分 |
+| [test_contracts.py](../tests/special_standalone/delta_critic/test_contracts.py) | CPU golden、输入校验、边界行为及可选源实现差分测试 |
+| [test_collection.py](../tests/special_standalone/delta_critic/test_collection.py) | V1 行导出、状态选择、模拟 MC 服务端到端及失败路径 |
+| [test_batch_sample.py](../tests/special_standalone/delta_critic/test_batch_sample.py) | 模拟 V1 top-k → uncertainty → paired MC，以及源配置/prompt/reward 差分 |
+| [scalar_model.py](../examples/delta_critic/scalar_model.py) | 源等价 backbone + FP32 带 bias scalar head、`value_layer` 下标、原生上下文检查 |
+| [training_data.py](../examples/delta_critic/training_data.py) | 原生长度解析、右 padding collate、hybrid continuation 匹配/选点与覆盖率统计 |
+| [scalar_loss.py](../examples/delta_critic/scalar_loss.py) | 逐样本 MSE/balanced MSE 与 hybrid loss、全局行均值分母与覆盖率指标 |
+| [engine.py](../examples/delta_critic/engine.py) | `model_type=delta_scalar` 的 FSDP2 engine，复用 V1 `TrainingWorker` 执行/优化器/checkpoint |
+| [training_config.py](../examples/delta_critic/training_config.py) | 训练、导入与评分共用的显式 scalar 语义配置与校验 |
+| [train.py](../examples/delta_critic/train.py) | torchrun 训练入口、数据指纹与语义变更记录、初始化/精确续训、step 目录预留 |
+| [checkpoint.py](../examples/delta_critic/checkpoint.py) | 源 `.pt` 导入器与带校验的 portable artifact 读写 |
+| [score.py](../examples/delta_critic/score.py) | 冻结 prefix 评分、窗口策略、TransferQueue 读写适配 |
+| [config_train_qwen3_8b.yaml](../examples/delta_critic/config_train_qwen3_8b.yaml)、[config_train_hybrid_qwen3_8b.yaml](../examples/delta_critic/config_train_hybrid_qwen3_8b.yaml) | 默认训练配置（`loss_type=nonzero_balanced_mse`、`max_length: null` 走模型原生上限） |
+| [config_train_qwen3_8b_mse.yaml](../examples/delta_critic/config_train_qwen3_8b_mse.yaml) | 仅用于 loss 对照的 plain MSE 变体（对应源的 `delta_resp_mse` 方法） |
+| [metrics.py](../examples/delta_critic/metrics.py) | 源 `metrics.py` 的纯函数移植（总体 std、并列平均秩 spearman、`regression_metrics`） |
+| [evaluate.py](../examples/delta_critic/evaluate.py) | 源 `06_eval_token_delta_unified.py` 的 delta 评测路径：四个指标块 + `P+t` 打分 + 反归一化 |
+| [test_critic_eval.py](../tests/special_standalone/delta_critic/test_critic_eval.py) | 评测的 golden 与源函数差分（AST 抽出源函数逐字段比对） |
+| [smoke_training.py](../examples/delta_critic/smoke_training.py) | 小模型真实 V1/FSDP2 训练、续训、microbatch 与 TransferQueue 验收脚本 |
+| [verify_legacy.py](../examples/delta_critic/verify_legacy.py) | 旧 checkpoint 等价性核对入口 |
+| [test_critic_core.py](../tests/special_standalone/delta_critic/test_critic_core.py)、[test_critic_scoring.py](../tests/special_standalone/delta_critic/test_critic_scoring.py)、[test_critic_training.py](../tests/special_standalone/delta_critic/test_critic_training.py)、[test_scalar_training.py](../tests/special_standalone/delta_critic/test_scalar_training.py) | 模型/target/loss/梯度差分、导入与评分、DP 与 microbatch 分母、step 目录预留回归 |
 | [check_license.py](../tests/special_sanity/check_license.py) | 增加 2026 年个人贡献者版权标头识别，原规则保留 |
 
 源仓库未修改；当前 PPO trainer 和训练循环未修改。V1 vLLM rollout 后端除结束原因 metadata 外，还在显式请求时返回 top-k 候选。本次批量入口尚未进行 GPU 运行或创建 PR。
 
 ## 7. 已执行验证
 
-包含源实现差分的测试命令：
+包含源实现差分的测试命令（环境需含 `torch`、`transformers` 与 `transfer_queue`）：
 
 ```bash
-VALUE_MODEL_ROOT=/scratch2/zhiyu/code/value_model \
-  /scratch2/zhiyu/miniconda3/envs/verl/bin/python -m pytest -q tests/examples/delta_critic
+CUDA_VISIBLE_DEVICES="" VALUE_MODEL_ROOT=/scratch2/zhiyu/code/value_model \
+  /scratch2/zhiyu/miniconda3/envs/verl-delta-vllm-20260925/bin/python -m pytest -q tests/special_standalone/delta_critic
 ```
 
-第 1 部分当时结果：**23 passed**。第 2 部分初始结果为 **30 passed**。加入批量入口的模拟 V1 top-k/MC 和源 prompt、reward、配置差分测试后，当前整组结果为 **32 passed**（提供 `VALUE_MODEL_ROOT`）。不提供该变量会跳过三个外部源仓库差分测试。
+第 1 部分当时结果：**23 passed**。第 2 部分初始结果为 **30 passed**。加入批量入口的模拟 V1 top-k/MC 和源 prompt、reward、配置差分测试后为 **32 passed**。加入第 3、4 部分的模型/target/loss/梯度差分、旧 checkpoint 导入与评分、DP 与 microbatch 分母、step 目录预留回归后，当前整组结果为 **101 passed**（提供 `VALUE_MODEL_ROOT`，全部在 `CUDA_VISIBLE_DEVICES=""` 下运行）。不提供该变量会跳过外部源仓库差分测试。
+
+本次修复了一处与实现无关的测试陈旧问题：采样配置有意新增 `save_continuations`/`save_individual_rewards` 两个落盘开关（采集链路正在使用），而源配置 parity 测试仍按逐键严格相等断言。现在该测试只允许这两个显式的本地新增键，任何其他键漂移仍会失败。
+
+第 3、4 部分的真实框架验证状态，区分「已执行」与「未执行」：
+
+| 项目 | 状态 | 证据 |
+| --- | --- | --- |
+| CPU 源差分：target、collate、两类 loss、hybrid、反归一化、梯度 | 已通过 | 见上方整组 `113 passed` |
+| 单卡真实 FSDP2 训练与 `--stop-after` 后恢复 | 已通过 | 恢复后最终权重逐位一致（`resume_max_abs = 0.0`） |
+| 单卡 microbatch 1 与 2 对照 | 已通过 | 最大权重差 `5.96e-08` |
+| **两卡 FSDP2 短训** | **已通过** | `two_gpu_max_abs = 1.86e-08`、`two_gpu_microbatch_max_abs = 9.31e-09`（FP32 容差 `2e-07`） |
+| step 目录预留（保存竞争）回归 | 已通过 | 2 进程 gloo：空目录必须所有 rank 都放行，已存在目录必须所有 rank 都拒绝 |
+| 真实 TransferQueue 冻结评分 | **已通过（真机 GPU）** | 两卡烟测中 `transfer_queue` 检查在真实 `FrozenDeltaWorker` + 真实 TQ 上通过，并断言权重与梯度逐位不变 |
+| V1 `infer_batch` 的真实 GPU worker 路径 | **已通过** | `smoke_training.py --v1-scoring-worker`：真实 forward-only `TrainingWorker` 与直接模型路径逐位一致（`max_abs_delta = 0.0`） |
+| 生产规模旧 `.pt` 权重 forward 对照 | **仍未执行，且导入器有已知局限** | 见下方「旧 checkpoint 导入器局限」 |
+| 原生长度上限不引入固定长度 padding、吞吐与峰值显存记录 | **部分** | 已记录 8B 训练吞吐与显存（见下方「8B critic 训练实测」）；未做长度上限的对照实验 |
+
+**执行环境。** 上述 GPU 项在另一台机器 `toast`（8× RTX PRO 6000 97 GB）上执行，使用与本地版本完全对齐的独立 conda 环境 `verl-delta`（torch 2.13.0+cu130、transformers 5.12.1、tensordict 0.10.0、ray 2.55.1、transferqueue 0.1.10）。之所以不在本机跑：本机 8 张卡被数据采集占满（`outputs/delta_qwen3_4b_base_dapo_20260927/collect.py` 为每个 shard 起独立 vLLM server），而 vLLM 按 `gpu_memory_utilization × 总显存` 预留 KV cache、不参考启动时刻的剩余空闲显存，并发占用显存可能让新 shard 启动时 OOM；该采集此前出现过一次 `exit_code -9` 的 shard 失败。
+
+**8B critic 训练实测（对比源的单卡基线）。** 源每个 critic 实验是 `accelerate launch --num_processes 1`（`--gpus 0,1,2` 表示并行跑 3 个不同实验），即**单卡** `batch 1 × grad_accum 8`，20 epoch / 1160 更新约 60 分钟，稳态约 2,800 tokens/s。本次 8 卡 DP 版有效 batch 同为 8，1120 步约 68 分钟、约 2,740 tokens/s：**总吞吐接近，但用了 8 倍 GPU**。原因是每卡只处理 1 条样本时 FSDP2 每层 all-gather / reduce-scatter 缺少计算量掩盖。因此后续默认改用**单卡 + `--global-batch 8 --microbatch 1`**，与源完全同构。
+
+**独立审核发现并修复的缺陷（第二轮）。** 一次独立代码审核（只读，未改实现）在真实接口上复现了若干问题，逐条核实结果如下：
+
+| 审核项 | 核实结论 | 处理 |
+| --- | --- | --- |
+| V1 冻结评分实际会报错 | **成立，且共 3 处缺陷** | 已修，见下 |
+| 有限 continuation budget 导致 hybrid 启动失败 | **成立** | `train.py` 的完整性检查改为扣除主动排除的 `over_budget` |
+| 真实旧 checkpoint 仍无法导入 | 成立，属已知局限 | 按用户决定暂不处理，保留在下方「导入器局限」 |
+| V1 评分未遵守评分精度配置 | **成立** | `forward_step` 按 `forward_only` 选 `scoring_autocast`，与独立评分一致 |
+| paired 模式评测目标不一致 | **不成立**（移植是忠实的） | 源的两条 eval 路径均无 label-mode 分支；已在 README 说明该口径差异 |
+
+V1 评分路径此前**从未真正端到端执行过**，因此积了三层缺陷，修复后实测通过：
+
+1. `DeltaFSDPEngine.forward_step` 里 `torch.inference_mode()` 与 FSDP2 不兼容——FSDP2 的 pre-forward hook 会对 all-gather 出来的张量调用 `_unsafe_preserve_version_counter`，inference tensor 没有 version counter，直接 `RuntimeError`。基类本就已用 `torch.no_grad()` 包住 forward-only 调用，故删除该行。
+2. 新增的 padding 裁剪无条件读取 `target_mask`/`signal_mask`，而评分 batch 只带 `target`/`loss_mask`，导致 `KeyError`。改为只裁剪存在的列。
+3. `score.py` 把 `global_token_num` 传成整数，框架的 FLOPs 计数器需要每行一个长度的列表（`sum(batch_seqlens)`）。
+
+现在 `smoke_training.py --v1-scoring-worker` 会真机跑通这条路径，并与直接模型路径逐位一致（`max_abs_delta = 0.0`），不再依赖 fake-worker 契约测试。
+
+**mse 与 balanced MSE 的实测对比（同一批数据、同一步数）。** 两次运行都是 1120 步、有效 batch 8、20 epochs 的等价预算；mse 版用 8 卡 DP、balanced 版用 1 卡，均为当时「按全局 batch 宽度填充」的代码（有效 batch 相同，故对比成立）。注意两者的训练 loss 数值**不可直接比较**——balanced MSE 把只占 2.4% 的 signal 组等权，绝对量级天然大十余倍；可比的只有反归一化后、与训练 loss 无关的评测指标。
+
+训练集（14146 个 selected state，样本内）：
+
+| 指标 | mse | balanced |
+| --- | ---: | ---: |
+| pearson | 0.4780 | **0.5865** |
+| spearman | 0.1307 | **0.2137** |
+| explained_variance | 0.2138 | **0.3287** |
+| 归一化 MSE | 1.597 | **1.366** |
+| macro F1 | 0.3372 | **0.4235** |
+| balanced accuracy | 0.3692 | **0.4176** |
+| 预测 neutral 比例 | 98.0% | **92.6%** |
+| nonzero sign 准确率 | 0.0545 | **0.1424** |
+
+rank_eval（2490 个 selected state，样本外）：
+
+| 指标 | mse | balanced |
+| --- | ---: | ---: |
+| pearson | **0.1116** | 0.0409 |
+| spearman | **0.0235** | 0.0028 |
+| explained_variance | **0.0083** | −0.0106 |
+| 归一化 MSE | **1.809** | 1.939 |
+| normalized pearson | **0.0649** | −0.0023 |
+| macro F1 | 0.2701 | **0.2998** |
+| balanced accuracy | 0.3381 | **0.3416** |
+| 预测 neutral 比例 | 99.3% | **93.5%** |
+| nonzero sign 准确率 | 0.0088 | **0.0416** |
+
+**结论：balanced MSE 确实解决了它被设计来解决的问题（稀有 signal 组被学到，样本内全面更好、塌缩显著减轻），但这个改善没有迁移到样本外。** 样本外两边都接近噪声底（pearson 0.04–0.11、explained_variance ≈0 或为负），balanced 用一部分相关系数换来了更好的稀有组行为（macro F1、balanced accuracy、nonzero sign 准确率更高，塌缩更轻）。这与源自身的 delta critic 表现一致——源那份评测报告里的 balanced critic 同样塌缩到近乎恒定预测。因此 **「默认 `nonzero_balanced_mse`」这一决定应理解为「与参考配方一致」，而不是「实测更优」**。两者都只跑了单 seed，样本外的差距（0.112 vs 0.041）虽约 3.5 个标准误，但无方差估计，不宜当作定论。
+
+评测命令与指标定义见 [README](../examples/delta_critic/README.md#delta-critic-evaluation-against-mc-labels)；本轮评测脚本是 `examples/delta_critic/evaluate.py`。
+
+**按 val loss 选最优 checkpoint 的修正。** 上述对比用的是 final（`step_00001120`）。源的约定是评测 `best.pt`（每次 eval 改善就重写一次），而我们的 trainer **不保存 best**，只每 100 步存 `step_*`，因此需要按 val loss 回挑：
+
+| 运行 | 最优 val step | 最优 val loss | final val loss |
+| --- | --- | ---: | ---: |
+| mse | `step_00000300` | 1.8532 | 1.8836 |
+| balanced | `step_00000400` | 25.8368 | **26.9891**（+4.5%） |
+
+rank_eval（2490 个 state）上 final 与 best 的对照：
+
+| 模型 | pearson | spearman | explained_var | 归一化 MSE | macro F1 | balanced acc | neutral% | nonzero sign acc |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| mse final@1120 | 0.1116 | 0.0235 | 0.0083 | 1.809 | 0.2701 | 0.3381 | 99.3% | 0.0088 |
+| mse best@300 | 0.0884 | 0.0275 | 0.0061 | 1.879 | 0.2786 | 0.3421 | 99.0% | 0.0153 |
+| balanced final@1120 | 0.0409 | 0.0028 | −0.0106 | 1.939 | 0.2998 | 0.3416 | 93.5% | 0.0416 |
+| balanced best@400 | **0.0808** | **0.0142** | **−0.0047** | **1.909** | **0.3097** | **0.3469** | **92.3%** | **0.0537** |
+
+两点修正与一点方法学结论：
+
+- **balanced 的 final 确实低估了它**：按 val loss 取 best 后，它在**每一个**指标上都优于自己的 final；相关系数赤字也从 0.041 vs 0.112 收窄到 0.081 vs 0.112。mse 的 best 与 final 则互有胜负，基本打平。
+- **方向性结论不变**：最优 checkpoint 对最优时，balanced 仍在**稀有组相关指标**上更好（macro F1 0.310 vs 0.279、balanced acc 0.347 vs 0.342、nonzero sign 0.054 vs 0.015、塌缩 92.3% vs 99.0%），mse 仍在**整体相关性**上更好（pearson 0.112 vs 0.081）。两者样本外都接近噪声底（pearson ≤0.11、explained_variance ≤0.008）。
+- **「val loss 最优」不等于「下游指标最优」**：balanced 两者方向一致（val 在 400 后上升，下游指标也随之后退），mse 则不一致（val 最优在 300，但下游相关性以 final 更好）。因此报告 critic 效果时必须写清用的哪个 checkpoint。
+- **待补能力**：train.py 应至少记录 `best_step`/`best_val_loss`（按 val loss），使 `best.pt` 语义可用而无需像源那样反复重写 15 GB 文件。这是当前与源的已知差异。
+
+**「我们的 critic 比源差」是数据造成的假象（交叉评测结论）。** 初次对比时我们看到 balanced 的 rank_eval pearson 只有 0.081，而源同类（`seed_*_delta_resp_bal`，同为 `local_td0` + `nonzero_balanced_mse`）是 0.190–0.216，看似差 2.3 倍。交叉评测否定了这个结论：把**我们的 checkpoint 打到源的数据集上**（数据来自 `data_qwen3_8b/`，100 rollouts / 3099 states），同一个模型的表现立刻进入源的区间。
+
+| 模型 | 评测数据 | selected states | pearson | explained_variance | pred_std | target_std |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| balanced（best@400） | 我们的 rank_eval | 2490 | 0.0808 | −0.0047 | 0.02618 | 0.14068 |
+| balanced（best@400） | 源的 rank_eval | 3099 | **0.1809** | **+0.0307** | 0.02544 | 0.11634 |
+| mse（final@1120） | 我们的 rank_eval | 2490 | 0.1116 | 0.0083 | 0.00756 | 0.14068 |
+| mse（final@1120） | 源的 rank_eval | 3099 | **0.1689** | **+0.0186** | 0.00879 | 0.11634 |
+
+作为参照，源自己的同类模型在同一份源数据上是 `budget_8_delta_resp_bal` 0.165、`seed_42_delta_resp_bal` 0.190 ——**我们的 balanced（0.181）落在其中甚至略高于 `budget_8`**。所以模型侧没有差距。
+
+**差在 target 本身的离散度，可逐层拆开。** 两边 MC 设置完全相同（都是 32 samples/state、`prefix_continuation_rewards` 长度 32），但 delta 的分布不同：
+
+| | 我们的 rank_eval | 源的 rank_eval |
+| --- | ---: | ---: |
+| states / rollout | 29.6 | 31.0 |
+| gt_delta std | **0.1407** | **0.1163** |
+| terminal 锚定占比（std） | 3.4%（0.395） | 3.2%（0.386） |
+| next 锚定占比（std） | 96.6%（**0.1183**） | 96.8%（**0.0844**） |
+| 中位选中间距 | 40 token | 40 token |
+| 平均 response 长度 | 1224 | 1286 |
+| terminal_reward 均值 / std | 0.155 / 0.362 | 0.130 / 0.336 |
+
+占 96.6% 的 next-anchored delta，我们的 std 高 **40%**，而中位间距完全相同（40 token）、response 长度接近、terminal 分布接近、MC 采样数相同。也就是说：**在同样的 token 间距上，我们采集出的 continuation reward 波动明显更大**，从而 delta 的目标方差更大；模型预测离散度两边几乎相同（0.0254 vs 0.0262），面对大 40% 的目标方差，相关系数自然被压低。
+
+**实践结论：**
+- **跨数据集的 pearson 不可比**。同一 checkpoint 在两组数据上能差 2.2 倍，因此任何与源数字的对比都必须固定评测集；引用源数字时要说明那是源自己的数据。
+- 若要让我们的 critic 在**我们自己的**数据上达到源的相关系数水平，要动的是**数据采集**（让 MC continuation reward 的分布/方差匹配），不是训练配方或模型。
+- 训练配方（`loss_mask=response`、`selected_segment`、`nonzero_balanced_mse`、LR/batch/epochs）与源一致这一点，由「同一模型在源数据上复现源水平」间接支持。
+
+**旧 checkpoint 导入器局限。** 导入器要求 checkpoint 记录 `delta_label_mode`，但真实产物普遍不记录该字段（26 个 objective 可导入的 delta checkpoint 中只有 2 个有，且值均为 `selected_segment`；它在源侧属于数据构造而非训练方法）。当前行为是明确报错，因此多数 7 月及更早的 checkpoint 无法导入。这属于「按设计拒绝而非静默假设」的可接受行为，但如果后续要真正使用旧 checkpoint，需要显式决定：评分路径本就不需要该字段，可放行并把训练路径改为要求显式提供。
 
 差分测试直接导入源 `offline_grpo.py`，并从源训练文件 AST 中选择 dataset/statistics 定义，以免引入训练依赖；第 2 部分还从源文件 AST 读取状态间隔选择与 MC request 函数比较。CPU 测试只验证纯函数；下面的 GPU 烟测另行验证 V1 client 的真实生成，不覆盖模型 forward、checkpoint、TransferQueue 训练数据流或分布式训练。
 
@@ -307,9 +458,94 @@ mc_local advantage    = [0, 0.1, 0,   0,   -0.3,  0]
 
 ## 8. 建议后续顺序
 
-1. 确定 checkpoint 接受范围、normalization metadata 兼容和超长窗口策略；同时在正式兼容环境中验收 AgentLoop/TransferQueue 未 padding 行到 delta adapter 的生产数据流。
-2. 按第 3 部分完成 scalar delta 模型、loss、旧 checkpoint 导入和数值门禁；优先用已有 critic checkpoint 验证转换和推理，随后完成训练及恢复。
-3. 按第 4、5 部分完成冻结评分 → V1 delta advantage → actor 更新的最小闭环，逐阶段执行源函数差分和真实 TransferQueue 验收。
-4. 基础组合验收后实现 hybrid，接入第 6 部分交替迭代，最后完成同预算基线与端到端效果评估。
+1. **（下一步，需要空闲 GPU）** 两卡 FSDP2 短训复跑并确认 DP 分母与保存竞争修复：`python examples/delta_critic/smoke_training.py --output /tmp/delta-critic-smoke`；随后补真实 forward-only GPU worker 评分和生产规模旧 `.pt` 的 forward 对照。
+2. 在正式兼容环境中验收 AgentLoop/TransferQueue 未 padding 行到 delta adapter 的生产数据流，并记录原生长度上限下的吞吐与峰值显存，确认没有固定长度 padding。
+3. 按第 5 部分接入 V1 delta advantage 与专用 policy loss，逐阶段执行源函数差分和真实 TransferQueue 验收。
+4. 接入第 6 部分 actor–critic 交替迭代，最后完成同预算基线与端到端效果评估。
 
 后续发现新的跨仓库差异时，更新第 2 节，记录用户选择后再实现依赖部分。每完成一个阶段，更新本文件中的状态、证据与实际验证命令。
+
+## 9. 本机 Qwen3-4B-Base 训练配置
+
+第 7 节的 8B 训练之所以在 `toast` 上跑，是因为本机 8 张卡当时被 4B 数据采集占满（见第 7 节「执行环境」）。该采集已于 2026-09-29T05:04Z `all_complete`，本机显卡全部空闲，4B 数据也就绪，因此改为**在本机用 Qwen3-4B-Base 复刻同一套配方**。
+
+**本阶段不需要改动任何库代码。** `train.py` 的模型只来自 YAML（没有 `--model-path` 覆盖），所以换模型等于换配置；`DeltaScalarModel` 也已能处理 4B 的权重共享。
+
+### 9.1 落地物
+
+| 文件 | 内容 |
+| --- | --- |
+| `examples/delta_critic/config_train_qwen3_4b_base.yaml` | 默认臂，`loss_type: nonzero_balanced_mse` |
+| `examples/delta_critic/config_train_qwen3_4b_base_mse.yaml` | 对照臂，仅 `loss_type: mse` |
+| `outputs/delta_qwen3_4b_base_dapo_20260927/train/make_split.py` | 生成 `split.json`；用同一个 adapter 校验 ID 集合与 `train.py` 期望一致 |
+| `outputs/delta_qwen3_4b_base_dapo_20260927/train/plan_smoke.py` | 复现 `RowIterator` 顺序，标出最坏 padding 的 step |
+| `outputs/delta_qwen3_4b_base_dapo_20260927/train/launch_train.sh` | 8 卡 `torchrun`，两臂串行 |
+
+`split.json` 沿用源回退口径（训练文件**位置尾部** `int(0.1 * rows)` 行作 eval），与 8B 的 `merge_partial.py:101-108` 一致：512 → 461 train / 51 eval。注意 `adapt_legacy_rows` 返回的 examples 是**按 rollout ID 排序**的，所以位置必须取自文件而非 adapter 列表。
+
+### 9.2 与 toast 8B 的设置对照
+
+| 项 | 8B（toast，已跑） | 4B base（本机，本次） |
+| --- | --- | --- |
+| 模型 | `Qwen/Qwen3-8B` | `Qwen/Qwen3-4B-Base` |
+| hidden / 层数 | 4096 / 36 | 2560 / 36 |
+| `tie_word_embeddings` | False（checkpoint 有 `lm_head.weight`） | **True**（无 `lm_head.weight`，head 被换成 `nn.Identity`） |
+| 原生上下文 / `max_length` | 40960 / null→40960 | **32768** / null→32768 |
+| 数据集 | DeepMath-103K | **DAPO-Math-17k** |
+| 采集温度 | 0.7 | **1.0** |
+| rollout `max_tokens` | 2048 | **30720** |
+| chat template | 否 | **是**（`enable_thinking`） |
+| MC 续写数/状态 | 32 | **16** |
+| 训练行数 | 496 → 447 / 49 | 512 → **461 / 51** |
+| 行长分布（token） | mean 1226、max 2229 | mean 2160、median 803、**max 31000** |
+| 有效 batch | 8 | **128** |
+| world_size | 1（balanced）/ 8（mse） | **8**（两臂） |
+| microbatch | 1 / 8 | **16** |
+| 更新步数 | 1120 | **80** |
+| objective / loss | `local_td0` / `nonzero_balanced_mse` 与 `mse` | 同 |
+| lr / wd / clip | 1e-5 / 0.0 / 1.0 | 同 |
+| lr schedule | 线性退火到 0、无 warmup（`engine.py:131`） | 同 |
+| dtype / attention / grad ckpt | bf16 / sdpa / true | 同 |
+| target_normalization / seed | standardize / 42 | 同 |
+| conda env | `verl-delta` | `verl-delta-vllm-20260925` |
+
+### 9.3 本次与 8B 的两条不可比之处
+
+1. **更新预算差 14.5 倍。** 保留了「20 epochs」口径，但有效 batch 从 8 提到 128，优化步数因此从 1160 降到 80，且 LR 在这 80 步内线性退火到 0。这是本次与 toast 最大的实质差异；若要恢复更新次数，需要把 epochs 提到约 290。
+2. **指标不可跨数据集比较。** 第 7 节已确认同一 checkpoint 在本仓 rank_eval 上是 0.081、在源 rank_eval 上是 0.181，差异来自目标离散度而非模型质量。4B 只能与自己的 mse 对照臂比，与 8B 只能做定性对照。
+
+### 9.4 长度分布导致的 padding 风险（已实测）
+
+`collate()` 把一张卡上的行 padding 到其中最长行，而 `forward_step` 只在 microbatch 内裁剪，所以 `--microbatch 16` 时 16 行全部按最长行宽度计算。8B 那份数据分布很紧（max 2229），这份 4B 数据有 18 行（3.5%）贴到 30720 上限，代价因此完全不同：
+
+| 项 | 实测 |
+| --- | --- |
+| 每个 rank 的平均 padding 宽度 | 17,826 token（`mb=16`） |
+| （step, rank）对中 padding > 30000 的比例 | **308/640 = 48%** |
+| 最坏 rank > 30000 的 step 数 | **79/80** |
+| 最坏 rank 的 checkpoint 激活峰值 | **~91.4 GB**（36 层 × 16 × 31000 × 2560 × 2B） |
+
+即从**第 1 步起**就有 6/8 张卡按 ~31000 宽度前向，96 GB 卡还要同时放模型、优化器状态和梯度，因此 `mb16` 很可能 OOM。
+
+**兜底阶梯**：若 OOM，按 `mb16 → mb8 → mb4` 降 `--microbatch`（`--global-batch 128` 对 8×8 和 8×4 都仍整除，有效 batch 不必变）。已知 `mb4` 的最坏激活约 22.9 GB。
+
+### 9.5 启动前必须执行
+
+```bash
+# 单元测试基线（未改库代码，当前 121 passed）
+CUDA_VISIBLE_DEVICES="" VALUE_MODEL_ROOT=/scratch2/zhiyu/code/value_model \
+  /scratch2/zhiyu/miniconda3/envs/verl-delta-vllm-20260925/bin/python \
+  -m pytest -q tests/special_standalone/delta_critic
+
+# 生成本节 9.1 的 split.json
+PYTHONPATH=. python outputs/delta_qwen3_4b_base_dapo_20260927/train/make_split.py
+
+# 最坏 padding 冒烟（step 1 即最坏情形，命中 6/8 卡）
+bash outputs/delta_qwen3_4b_base_dapo_20260927/train/launch_train.sh --arm balanced --stop-after 1
+
+# 正式两臂串行训练
+tmux new-session -d -s delta_4b_train \
+  'bash outputs/delta_qwen3_4b_base_dapo_20260927/train/launch_train.sh'
+```
+
+**状态：配置、数据与启动脚本已就绪；训练尚未执行，冒烟也未跑。**
