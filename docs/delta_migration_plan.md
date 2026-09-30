@@ -1,6 +1,7 @@
 # Delta 训练迁移计划与进度
 
-更新日期：2026-09-25。工作分支：`delta`，从 `main` 创建。
+更新日期：2026-09-28。工作分支：`delta`，从 `main` 创建。
+Last updated: 09/30/2026
 
 本文记录从 `value_model` 向当前 verl 仓库迁移 delta 训练的整体计划、已确认的算法选择、当前实现及待决事项，供后续开发接续。详细接口用法见 [delta 数据契约 README](../examples/delta_critic/README.md)。
 

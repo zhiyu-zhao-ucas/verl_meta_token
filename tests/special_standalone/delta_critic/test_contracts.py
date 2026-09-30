@@ -40,13 +40,25 @@ from examples.delta_critic.target_ops import (
 @pytest.fixture
 def legacy():
     rollout = {
-        "id": "r1", "prompt_id": "p1", "prompt_token_ids": [10, 11],
-        "response_token_ids": [20, 21, 22, 23, 24, 25], "terminal_reward": 1.0,
-        "policy_token_mask": [1, 1, 0, 1, 1, 1], "finish_reason": "length", "split": "train",
+        "id": "r1",
+        "prompt_id": "p1",
+        "prompt_token_ids": [10, 11],
+        "response_token_ids": [20, 21, 22, 23, 24, 25],
+        "terminal_reward": 1.0,
+        "policy_token_mask": [1, 1, 0, 1, 1, 1],
+        "finish_reason": "length",
+        "split": "train",
     }
     rows = [
-        {"rollout_id": "r1", "state_id": "s1", "token_index": 1, "v_prefix": 0.2, "v_next": 0.3,
-         "prefix_response_token_ids": [20], "mc_num_samples": 32},
+        {
+            "rollout_id": "r1",
+            "state_id": "s1",
+            "token_index": 1,
+            "v_prefix": 0.2,
+            "v_next": 0.3,
+            "prefix_response_token_ids": [20],
+            "mc_num_samples": 32,
+        },
         {"rollout_id": "r1", "state_id": "s4", "token_index": 4, "v_prefix": 0.7, "v_next": 0.4},
     ]
     return rollout, rows
@@ -144,17 +156,20 @@ def test_legacy_precedence_and_metadata(legacy, config):
     assert examples[0].rollout.metadata["response_token_ids"][0] == 20
 
 
-@pytest.mark.parametrize("mutation,match", [
-    (lambda r, s: s.append(dict(s[0], state_id="other")), "Duplicate selected"),
-    (lambda r, s: s[0].update(token_index=6, prefix_response_token_ids=r["response_token_ids"]), "out of range"),
-    (lambda r, s: s[0].update(prefix_response_token_ids=[99]), "prefix_response"),
-    (lambda r, s: s[0].update(prompt_token_ids=[99]), "prompt_token"),
-    (lambda r, s: s[0].update(rollout_id="absent"), "missing rollout"),
-    (lambda r, s: s[0].pop("v_prefix"), "Missing required"),
-    (lambda r, s: r.update(policy_token_mask=[1]), "binary entries"),
-    (lambda r, s: s[1].update(state_id="s1"), "Duplicate state_id"),
-    (lambda r, s: s[0].update(v_prefix=float("nan")), "finite"),
-])
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda r, s: s.append(dict(s[0], state_id="other")), "Duplicate selected"),
+        (lambda r, s: s[0].update(token_index=6, prefix_response_token_ids=r["response_token_ids"]), "out of range"),
+        (lambda r, s: s[0].update(prefix_response_token_ids=[99]), "prefix_response"),
+        (lambda r, s: s[0].update(prompt_token_ids=[99]), "prompt_token"),
+        (lambda r, s: s[0].update(rollout_id="absent"), "missing rollout"),
+        (lambda r, s: s[0].pop("v_prefix"), "Missing required"),
+        (lambda r, s: r.update(policy_token_mask=[1]), "binary entries"),
+        (lambda r, s: s[1].update(state_id="s1"), "Duplicate state_id"),
+        (lambda r, s: s[0].update(v_prefix=float("nan")), "finite"),
+    ],
+)
 def test_invalid_legacy(legacy, mutation, match):
     rollout, rows = legacy
     mutation(rollout, rows)
@@ -181,15 +196,24 @@ def test_empty_zero_variance_and_missing_prediction(example, config):
     assert denormalize_predictions([0, 1], mode="none") == (0, 1)
 
 
-@pytest.mark.parametrize("finish,length,assume,expected", [
-    ("eos", False, False, True), ("stop", False, False, True),
-    ("length", True, False, True), ("length", False, False, False),
-    ("abort", True, True, False), (None, True, True, True),
-])
+@pytest.mark.parametrize(
+    "finish,length,assume,expected",
+    [
+        ("eos", False, False, True),
+        ("stop", False, False, True),
+        ("length", True, False, True),
+        ("length", False, False, False),
+        ("abort", True, True, False),
+        (None, True, True, True),
+    ],
+)
 def test_terminal(finish, length, assume, expected):
-    assert terminal_after_last_token(
-        finish, treat_length_truncation_as_terminal=length, assume_legacy_last_token_terminal=assume
-    ) is expected
+    assert (
+        terminal_after_last_token(
+            finish, treat_length_truncation_as_terminal=length, assume_legacy_last_token_terminal=assume
+        )
+        is expected
+    )
 
 
 def test_terminal_unknown_requires_choice():

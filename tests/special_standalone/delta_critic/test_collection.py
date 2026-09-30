@@ -26,29 +26,49 @@ import pytest
 from examples.delta_critic.collection import export_v1_rollouts, prompt_split
 from examples.delta_critic.legacy_adapter import adapt_legacy_rows
 from examples.delta_critic.mc_labeling import (
-    MCConfig, MCContinuation, build_mc_requests, label_mc_states, label_mc_states_async,
+    MCConfig,
+    MCContinuation,
+    build_mc_requests,
+    label_mc_states,
+    label_mc_states_async,
 )
 from examples.delta_critic.state_selection import select_spaced_states, select_states
 from examples.delta_critic.v1_sampler import sample_v1_continuations
 
 
 def _rollout(finish_reason="stop"):
-    rows = [{
-        "uid": "u1", "prompt_id": "math-1", "session_id": 0, "global_steps": 7,
-        "prompts": [10, 11], "responses": [20, 21, 22],
-        "response_mask": [1, 1, 1], "rollout_log_probs": [-0.1, -0.2, -0.3],
-        "reward_score": 1.0, "finish_reason": finish_reason, "gold_answer": "42",
-    }]
+    rows = [
+        {
+            "uid": "u1",
+            "prompt_id": "math-1",
+            "session_id": 0,
+            "global_steps": 7,
+            "prompts": [10, 11],
+            "responses": [20, 21, 22],
+            "response_mask": [1, 1, 1],
+            "rollout_log_probs": [-0.1, -0.2, -0.3],
+            "reward_score": 1.0,
+            "finish_reason": finish_reason,
+            "gold_answer": "42",
+        }
+    ]
     return export_v1_rollouts(
-        rows, actor_version="actor-step-7", sampling_config={"temperature": 0.7, "top_p": 0.9},
-        eval_fraction=0.2, split_seed="experiment-1",
+        rows,
+        actor_version="actor-step-7",
+        sampling_config={"temperature": 0.7, "top_p": 0.9},
+        eval_fraction=0.2,
+        split_seed="experiment-1",
     )
 
 
 def _config(mode="paired_next_state", **kwargs):
     return MCConfig(
-        mode=mode, continuations_per_state=2, sampling_config={"temperature": 0.8, "max_tokens": 4},
-        actor_version="actor-step-7", continuation_skip_special_tokens=True, **kwargs,
+        mode=mode,
+        continuations_per_state=2,
+        sampling_config={"temperature": 0.8, "max_tokens": 4},
+        actor_version="actor-step-7",
+        continuation_skip_special_tokens=True,
+        **kwargs,
     )
 
 
@@ -61,15 +81,41 @@ def test_v1_export_and_prompt_split():
     assert prompt_split("math-1", eval_fraction=0.2, seed="experiment-1") == rows[0]["split"]
     with pytest.raises(ValueError, match="align"):
         export_v1_rollouts(
-            [dict(uid="u", prompt_id="p", global_steps=1, prompts=[1], responses=[2], response_mask=[1],
-                  reward_score=1, rollout_log_probs=[0, 0])], actor_version="a",
-            sampling_config={"temperature": 1}, eval_fraction=0.2, split_seed="x",
+            [
+                dict(
+                    uid="u",
+                    prompt_id="p",
+                    global_steps=1,
+                    prompts=[1],
+                    responses=[2],
+                    response_mask=[1],
+                    reward_score=1,
+                    rollout_log_probs=[0, 0],
+                )
+            ],
+            actor_version="a",
+            sampling_config={"temperature": 1},
+            eval_fraction=0.2,
+            split_seed="x",
         )
     rows = export_v1_rollouts(
-        [dict(uid="u", prompt_id="p", global_steps=1, prompts=[1], responses=[2],
-              response_mask=[1], reward_score=1, stop_reason="completed",
-              extra_fields={"finish_reason": "length"})],
-        actor_version="a", sampling_config={"temperature": 1}, eval_fraction=0, split_seed="x",
+        [
+            dict(
+                uid="u",
+                prompt_id="p",
+                global_steps=1,
+                prompts=[1],
+                responses=[2],
+                response_mask=[1],
+                reward_score=1,
+                stop_reason="completed",
+                extra_fields={"finish_reason": "length"},
+            )
+        ],
+        actor_version="a",
+        sampling_config={"temperature": 1},
+        eval_fraction=0,
+        split_seed="x",
     )
     assert rows[0]["finish_reason"] == "length"
     assert rows[0]["stop_reason"] == "completed"
@@ -79,7 +125,10 @@ def test_selection_source_tie_break_and_prefix():
     rollout = _rollout()[0]
     assert select_spaced_states([(1, 0), (1, 1), (1, 2)], 2, 2) == [2, 0]
     states = select_states(
-        [rollout], strategy="indices", states_per_response=2, min_token_gap=1,
+        [rollout],
+        strategy="indices",
+        states_per_response=2,
+        min_token_gap=1,
         indices_by_rollout={rollout["id"]: [0, 2]},
     )
     assert [row["token_index"] for row in states] == [2, 0]
@@ -93,13 +142,17 @@ def test_selection_source_tie_break_and_prefix():
 def test_uncertainty_selection_uses_source_score():
     rollout = _rollout()[0]
     rollout["tokens"] = [
-        {"token_index": i, "entropy": value, "top1_prob": 0.5,
-         "top_candidates": [{"token_id": 100 + i, "prob": 0.7}]}
+        {"token_index": i, "entropy": value, "top1_prob": 0.5, "top_candidates": [{"token_id": 100 + i, "prob": 0.7}]}
         for i, value in enumerate([0.1, 0.8, 0.3])
     ]
     states = select_states(
-        [rollout], strategy="uncertainty", states_per_response=1,
-        entropy_weight=1, low_top1_weight=1, final_window_tokens=0, final_window_weight=0,
+        [rollout],
+        strategy="uncertainty",
+        states_per_response=1,
+        entropy_weight=1,
+        low_top1_weight=1,
+        final_window_tokens=0,
+        final_window_weight=0,
     )
     assert states[0]["token_index"] == 1
     assert states[0]["selection_score"] == pytest.approx(1.3)
@@ -110,9 +163,12 @@ def test_mc_end_to_end_terminal_and_request_dedup():
     rollouts = _rollout()
     rid = rollouts[0]["id"]
     states = select_states(
-        rollouts, strategy="indices", states_per_response=2, indices_by_rollout={rid: [1, 2]},
+        rollouts,
+        strategy="indices",
+        states_per_response=2,
+        indices_by_rollout={rid: [1, 2]},
     )
-    config = _config(save_individual_rewards=True)
+    config = _config(save_individual_rewards=True, save_continuations=True)
     requests, links = build_mc_requests(rollouts, states, config)
     assert len(requests) == 2  # before t2 == after t1
     assert links[f"{rid}:t2"][1] is None  # terminal shortcut
@@ -123,7 +179,10 @@ def test_mc_end_to_end_terminal_and_request_dedup():
         return [MCContinuation((30,), "1"), MCContinuation((31,), "0")]
 
     labels = label_mc_states(
-        rollouts, states, config, sample=sample,
+        rollouts,
+        states,
+        config,
+        sample=sample,
         decode_prefix=lambda ids: "".join(map(str, ids)),
         score=lambda response, rollout: float(response.endswith("1")),
     )
@@ -136,6 +195,10 @@ def test_mc_end_to_end_terminal_and_request_dedup():
     assert by_index[2]["mc_next_num_samples"] == 0
     assert by_index[2]["delta"] == 0.5
     assert by_index[2]["mc_actor_version"] == "actor-step-7"
+    assert by_index[1]["mc_continuations"] == [
+        {"continuation_index": 0, "token_ids": [30], "text": "1", "reward": 1.0},
+        {"continuation_index": 1, "token_ids": [31], "text": "0", "reward": 0.0},
+    ]
     examples, diagnostics = adapt_legacy_rows(rollouts, labels)
     assert len(examples[0].states) == 2 and not diagnostics
 
@@ -144,9 +207,7 @@ def test_mc_nonterminal_last_token_and_validation():
     rollouts = _rollout(finish_reason="length")
     rid = rollouts[0]["id"]
     states = select_states(rollouts, strategy="indices", states_per_response=1, indices_by_rollout={rid: [2]})
-    requests, links = build_mc_requests(
-        rollouts, states, _config(treat_length_truncation_as_terminal=False)
-    )
+    requests, links = build_mc_requests(rollouts, states, _config(treat_length_truncation_as_terminal=False))
     assert len(requests) == 2 and links[states[0]["state_id"]][1] is not None
     missing_finish = deepcopy(rollouts)
     missing_finish[0]["finish_reason"] = None
@@ -179,19 +240,25 @@ def test_v1_server_client_sampler_round_trip():
             return "1"
 
     async def sample(request, config):
-        return await sample_v1_continuations(
-            request, config, server_client=Client(), tokenizer=Tokenizer()
-        )
+        return await sample_v1_continuations(request, config, server_client=Client(), tokenizer=Tokenizer())
 
-    labels = asyncio.run(label_mc_states_async(
-        rollouts, states, _config(), sample=sample, decode_prefix=lambda ids: "",
-        score=lambda response, rollout: float(response == "1"),
-    ))
+    labels = asyncio.run(
+        label_mc_states_async(
+            rollouts,
+            states,
+            _config(save_continuations=True),
+            sample=sample,
+            decode_prefix=lambda ids: "",
+            score=lambda response, rollout: float(response == "1"),
+        )
+    )
     assert len(calls) == 2
     assert all(call["prompt_ids"] == [10, 11, 20, 21] for call in calls)
     assert all(call["sampling_params"] == {"temperature": 0.8, "max_tokens": 4} for call in calls)
     assert labels[0]["v_prefix"] == 1.0
     assert labels[0]["v_next"] == 1.0
+    assert len(labels[0]["mc_continuations"]) == 2
+    assert labels[0]["mc_continuations"][0]["token_ids"] == [30]
 
 
 def test_source_selection_and_mc_request_differential():
@@ -209,9 +276,7 @@ def test_source_selection_and_mc_request_differential():
 
     selection = source_functions("02_select_states.py", {"select_spaced_states"})
     scored = [(0.7, 0), (0.9, 1), (0.9, 2)]
-    source_chosen = selection["select_spaced_states"](
-        [(score, index, [], 0.0) for score, index in scored], 2, 2
-    )
+    source_chosen = selection["select_spaced_states"]([(score, index, [], 0.0) for score, index in scored], 2, 2)
     assert select_spaced_states(scored, 2, 2) == [item[1] for item in source_chosen]
 
     source_mc = source_functions(
@@ -221,7 +286,10 @@ def test_source_selection_and_mc_request_differential():
     rollouts = _rollout()
     rid = rollouts[0]["id"]
     states = select_states(
-        rollouts, strategy="indices", states_per_response=2, indices_by_rollout={rid: [1, 2]},
+        rollouts,
+        strategy="indices",
+        states_per_response=2,
+        indices_by_rollout={rid: [1, 2]},
     )
     source_requests, source_links = source_mc["build_unique_prefix_requests"](
         states, {rid: rollouts[0]}, {"mc": {"state_value_mode": "paired_next_state"}}
