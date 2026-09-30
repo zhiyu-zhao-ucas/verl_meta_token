@@ -1,0 +1,30 @@
+# Default delta-critic recipe, Qwen3-4B-Base on the local DAPO-Math-17k collection.
+# Field-for-field identical to config_train_qwen3_8b.yaml except `model_path`;
+# this is the 4B arm of the toast-8B / local-4B comparison.
+#
+# `nonzero_balanced_mse` is what every source delta critic used, including the
+# verified June/July reference run (seed_42_delta_resp_bal:
+# loss_type=nonzero_balanced_mse, balance_active=True). Plain `mse` corresponds
+# to the source's separate `delta_resp_mse` method and lives in
+# config_train_qwen3_4b_base_mse.yaml for comparison only.
+#
+# Effective global batch and update budget are REQUIRED CLI arguments.
+model_path: Qwen/Qwen3-4B-Base
+dtype: bfloat16
+attention_implementation: sdpa
+value_layer: -1
+objective: local_td0
+loss_type: nonzero_balanced_mse
+loss_mask: response
+delta_label_mode: selected_segment
+target_normalization: standardize
+# Null resolves to Qwen3-4B-Base's native max_position_embeddings (32768, not the
+# 8B's 40960). The longest collected train row is 31000 tokens, so the full
+# window stays available and `window_policy: full` never has to truncate.
+max_length: null
+window_policy: full
+gradient_checkpointing: true
+learning_rate: 1.0e-5
+weight_decay: 0.0
+gradient_clip: 1.0
+seed: 42

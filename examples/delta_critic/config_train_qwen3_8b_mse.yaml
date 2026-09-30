@@ -1,0 +1,23 @@
+# Comparison-only variant: plain MSE instead of the default balanced MSE.
+# This matches the source sweep's `delta_resp_mse` method, which is *not* what
+# the verified June/July critic runs or the source's unified eval report used.
+# Kept so the completed mse run stays reproducible for the loss comparison.
+#
+# Effective global batch and update budget are REQUIRED CLI arguments.
+model_path: Qwen/Qwen3-8B
+dtype: bfloat16
+attention_implementation: sdpa
+value_layer: -1
+objective: local_td0
+loss_type: mse
+loss_mask: response
+delta_label_mode: selected_segment
+target_normalization: standardize
+# Null resolves to Qwen3-8B's native max_position_embeddings (40960).
+max_length: null
+window_policy: full
+gradient_checkpointing: true
+learning_rate: 1.0e-5
+weight_decay: 0.0
+gradient_clip: 1.0
+seed: 42
