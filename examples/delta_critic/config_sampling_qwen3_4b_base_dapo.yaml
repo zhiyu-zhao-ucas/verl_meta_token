@@ -1,0 +1,66 @@
+# Qwen3-4B-Base sampling on DAPO-Math-17k.
+# Mirrors the 8B official sampling settings (examples/delta_critic/config_sampling_qwen3_8b.yaml
+# as transformed by outputs/delta_qwen3_8b_official_16x_20260927/collect.py::prepare()),
+# with the length cap set to the 4B-Base model default and the dataset swapped to DAPO.
+seed: 42
+model:
+  actor_model: Qwen/Qwen3-4B-Base
+  trust_remote_code: true
+  dtype: bfloat16
+  max_model_len: 32768          # Qwen3-4B-Base default (8B used 40960)
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  gpu_memory_utilization: 0.9
+data:
+  train_hf_dataset:
+    repo_id: BytedTsinghua-SIA/DAPO-Math-17k
+    split: train
+  test_hf_dataset:
+    repo_id: HuggingFaceH4/MATH-500
+    split: test
+  rank_eval_hf_dataset:
+    repo_id: BytedTsinghua-SIA/DAPO-Math-17k
+    split: train
+prompt:
+  template: null
+  apply_template_to_existing_prompt: false
+  use_model_chat_template: true
+  chat_template_kwargs:
+    enable_thinking: true
+reward:
+  method: math_verify
+  fallback_on_import_error: false
+smoke:
+  train_prompts: 512
+  test_prompts: 100
+  rank_eval_prompts: 100
+  rank_eval_prompt_offset: 512
+  responses_per_prompt: 1
+  states_per_response: 64
+  top_mass: 0.8
+rollout:
+  max_tokens: 30720             # 32768 - 2048 prompt budget (8B: 40960 - 2048 = 38912)
+  temperature: 1.0
+  top_p: 0.95
+  repetition_penalty: null
+  stop: null
+  include_stop_str_in_output: null
+  top_k_logprobs: 20
+  top_k: 20
+  min_p: 0.0
+state_selection:
+  entropy_weight: 0.0
+  low_top1_weight: 1.0
+  final_window_weight: 0.0
+  final_window_tokens: 64
+  min_token_gap: 32
+  max_candidates: 5
+mc:
+  continuations_per_state: 16
+  save_individual_rewards: true
+  save_continuations: true
+  max_continuation_tokens: 30720   # 32768 - 2048
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.0

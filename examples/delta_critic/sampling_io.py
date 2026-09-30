@@ -19,7 +19,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_MATH_PROMPT_TEMPLATE = (
     "Solve the following math problem carefully.\n"
     "Show your reasoning and put the final answer in \\boxed{{}}.\n\n"
@@ -37,7 +36,15 @@ def _first(row: dict, *keys: str):
 def _stringify(value: Any) -> str:
     if value is None:
         return ""
-    return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+    return json.dumps(value, ensure_ascii=False) if isinstance(value, dict | list) else str(value)
+
+
+def _prompt_text(value: Any) -> str:
+    if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+        contents = [item.get("content") for item in value if item.get("content")]
+        if contents:
+            return "\n".join(str(content) for content in contents)
+    return _stringify(value)
 
 
 def normalize_prompt_row(row: dict, index: int, prompt_config: dict | None = None) -> dict:
@@ -45,7 +52,7 @@ def normalize_prompt_row(row: dict, index: int, prompt_config: dict | None = Non
     base = _first(row, "prompt", "question", "problem")
     if base is None or not _stringify(base).strip():
         raise ValueError("Prompt row must contain nonempty prompt, question, or problem")
-    base_text = _stringify(base).strip()
+    base_text = _prompt_text(base).strip()
     template = prompt_config.get("template")
     if template and ("prompt" not in row or prompt_config.get("apply_template_to_existing_prompt", False)):
         fields = {key: _stringify(value) for key, value in row.items()}
@@ -61,7 +68,13 @@ def normalize_prompt_row(row: dict, index: int, prompt_config: dict | None = Non
     else:
         prompt = base_text
     answer = _first(row, "gold_answer", "answer", "target", "final_answer", "solution")
+    reward_model = row.get("reward_model")
+    if answer is None and isinstance(reward_model, dict):
+        answer = _first(reward_model, "ground_truth", "answer", "target")
     identifier = _first(row, "id", "unique_id")
+    extra_info = row.get("extra_info")
+    if identifier is None and isinstance(extra_info, dict):
+        identifier = _first(extra_info, "index", "id", "unique_id")
     return {
         "prompt_id": str(identifier or index),
         "prompt": prompt,
@@ -105,14 +118,18 @@ def load_prompt_rows(
     else:
         from datasets import load_dataset
 
-        spec = {"path": hf_source} if isinstance(hf_source, str) else {
-            "path": hf_source.get("repo_id") or hf_source.get("path"),
-            "name": hf_source.get("config_name"),
-            "split": hf_source.get("split", split),
-            "revision": hf_source.get("revision"),
-            "data_files": hf_source.get("data_files"),
-            "streaming": bool(hf_source.get("streaming", False)),
-        }
+        spec = (
+            {"path": hf_source}
+            if isinstance(hf_source, str)
+            else {
+                "path": hf_source.get("repo_id") or hf_source.get("path"),
+                "name": hf_source.get("config_name"),
+                "split": hf_source.get("split", split),
+                "revision": hf_source.get("revision"),
+                "data_files": hf_source.get("data_files"),
+                "streaming": bool(hf_source.get("streaming", False)),
+            }
+        )
         if isinstance(hf_source, str):
             spec["split"] = split
         if not spec["path"]:
@@ -150,7 +167,7 @@ def _boxed_answer(text: str) -> str | None:
     if start < 0:
         return None
     depth, result = 1, []
-    for char in text[start + len(marker):]:
+    for char in text[start + len(marker) :]:
         if char == "{":
             depth += 1
         elif char == "}":

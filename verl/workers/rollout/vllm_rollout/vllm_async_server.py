@@ -36,6 +36,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
+from vllm.sampling_params import RequestOutputKind
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -84,6 +85,13 @@ if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _collect_delta_mc_token_ids(outputs: list[Any], count: int) -> list[list[int]]:
+    completions = sorted(outputs, key=lambda item: item.index)
+    if len(completions) != count or [item.index for item in completions] != list(range(count)):
+        raise ValueError("vLLM returned an incomplete delta_mc_n result")
+    return [list(item.token_ids) for item in completions]
 
 
 class vLLMHttpServer:
@@ -622,6 +630,18 @@ class vLLMHttpServer:
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
         delta_top_logprobs = sampling_params.pop("delta_top_logprobs", None)
+        delta_mc_n = sampling_params.pop("delta_mc_n", None)
+        if delta_mc_n is not None:
+            if isinstance(delta_mc_n, bool) or not isinstance(delta_mc_n, int) or delta_mc_n < 1:
+                raise ValueError("delta_mc_n must be a positive integer")
+            if delta_top_logprobs is not None:
+                raise ValueError("delta_mc_n cannot be combined with delta_top_logprobs")
+            if "n" in sampling_params:
+                raise ValueError("delta_mc_n cannot be combined with n")
+            sampling_params["n"] = delta_mc_n
+            # vLLM streams one child completion per output by default. Request
+            # its aggregated final output so all n continuations are present.
+            sampling_params["output_kind"] = RequestOutputKind.FINAL_ONLY
         sampled_logprobs = sampling_params.pop("logprobs", False)
         if delta_top_logprobs is not None:
             if (
@@ -730,6 +750,8 @@ class vLLMHttpServer:
         # Prefix-cache hit count for this request; consumers surface it as
         # OpenAI usage.prompt_tokens_details.cached_tokens.
         extra_fields["num_cached_tokens"] = getattr(final_res, "num_cached_tokens", None)
+        if delta_mc_n is not None:
+            extra_fields["delta_mc_token_ids"] = _collect_delta_mc_token_ids(final_res.outputs, delta_mc_n)
         extract_prompt_logprobs(
             output=final_res,
             num_prompt_logprobs=sampling_params.prompt_logprobs,
@@ -745,11 +767,14 @@ class vLLMHttpServer:
                 candidates = []
                 for token_id, entry in top.items():
                     value = float(entry.logprob)
-                    candidates.append({
-                        "token_id": int(token_id), "logprob": value,
-                        "prob": float(math.exp(value)),
-                        "token": getattr(entry, "decoded_token", None),
-                    })
+                    candidates.append(
+                        {
+                            "token_id": int(token_id),
+                            "logprob": value,
+                            "prob": float(math.exp(value)),
+                            "token": getattr(entry, "decoded_token", None),
+                        }
+                    )
                 top_rows.append(sorted(candidates, key=lambda item: item["prob"], reverse=True))
             extra_fields["delta_top_logprobs"] = top_rows
 

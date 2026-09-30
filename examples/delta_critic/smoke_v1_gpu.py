@@ -48,6 +48,7 @@ async def main(model_path: str, actor_version: str, gpu_memory_utilization: floa
     rollout_config.skip_tokenizer_init = False
     rollout_config.prompt_length = 128
     rollout_config.response_length = 16
+    rollout_config.max_model_len = 2048
     rollout_config.gpu_memory_utilization = gpu_memory_utilization
     rollout_config.standalone_gpu_memory_utilization = gpu_memory_utilization
     ray.init(num_gpus=1, include_dashboard=False, log_to_driver=False)
@@ -69,39 +70,67 @@ async def main(model_path: str, actor_version: str, gpu_memory_utilization: floa
             raise RuntimeError("V1 output did not preserve raw finish_reason")
         # This is an interface check; the simple reward is not a math benchmark.
         row = {
-            "uid": "delta-smoke-prompt-1", "prompt_id": "delta-smoke-prompt-1", "global_steps": 0,
-            "prompts": prompt_ids, "responses": response_ids, "response_mask": [1] * len(response_ids),
-            "rollout_log_probs": output.log_probs, "reward_score": float("2" in response_text),
-            "stop_reason": output.stop_reason, "extra_fields": output.extra_fields, "gold_answer": "2",
+            "uid": "delta-smoke-prompt-1",
+            "prompt_id": "delta-smoke-prompt-1",
+            "global_steps": 0,
+            "prompts": prompt_ids,
+            "responses": response_ids,
+            "response_mask": [1] * len(response_ids),
+            "rollout_log_probs": output.log_probs,
+            "reward_score": float("2" in response_text),
+            "stop_reason": output.stop_reason,
+            "extra_fields": output.extra_fields,
+            "gold_answer": "2",
         }
         rollouts = export_v1_rollouts(
-            [row], actor_version=actor_version, sampling_config=rollout_sampling,
-            eval_fraction=0.0, split_seed="delta-v1-smoke",
+            [row],
+            actor_version=actor_version,
+            sampling_config=rollout_sampling,
+            eval_fraction=0.0,
+            split_seed="delta-v1-smoke",
         )
         indices = sorted({0, len(response_ids) - 1})
         states = select_states(
-            rollouts, strategy="indices", states_per_response=len(indices),
+            rollouts,
+            strategy="indices",
+            states_per_response=len(indices),
             indices_by_rollout={rollouts[0]["id"]: indices},
         )
         mc_config = MCConfig(
-            mode="paired_next_state", continuations_per_state=2,
+            mode="paired_next_state",
+            continuations_per_state=2,
             sampling_config={"temperature": 0.7, "top_p": 0.9, "max_tokens": 8},
-            actor_version=actor_version, continuation_skip_special_tokens=True,
+            actor_version=actor_version,
+            continuation_skip_special_tokens=True,
         )
         labels = await label_mc_states_async(
-            rollouts, states, mc_config,
-            sample=partial(sample_v1_continuations, server_client=client, tokenizer=tokenizer),
+            rollouts,
+            states,
+            mc_config,
+            sample=partial(sample_v1_continuations, server_client=client, tokenizer=tokenizer, native_n_batch_size=2),
             decode_prefix=lambda ids: tokenizer.decode(ids, skip_special_tokens=False),
             score=lambda text, rollout: float("2" in text),
         )
         examples, diagnostics = adapt_legacy_rows(rollouts, labels)
-        print("DELTA_V1_SMOKE_RESULT=" + json.dumps({
-            "model": model_path, "response_tokens": len(response_ids),
-            "finish_reason": finish_reason, "stop_reason": output.stop_reason,
-            "behavior_logprobs": len(output.log_probs or []), "selected_indices": indices,
-            "mc_rows": len(labels), "mc_budgets": [r["mc_num_samples"] for r in labels],
-            "validated_states": len(examples[0].states), "diagnostics": diagnostics,
-        }, sort_keys=True), flush=True)
+        print(
+            "DELTA_V1_SMOKE_RESULT="
+            + json.dumps(
+                {
+                    "model": model_path,
+                    "response_tokens": len(response_ids),
+                    "finish_reason": finish_reason,
+                    "stop_reason": output.stop_reason,
+                    "behavior_logprobs": len(output.log_probs or []),
+                    "selected_indices": indices,
+                    "mc_rows": len(labels),
+                    "mc_budgets": [r["mc_num_samples"] for r in labels],
+                    "validated_states": len(examples[0].states),
+                    "diagnostics": diagnostics,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     finally:
         ray.shutdown()
 
