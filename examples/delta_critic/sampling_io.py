@@ -13,8 +13,11 @@
 # limitations under the License.
 """Prompt and math reward handling for the source-compatible sampling path."""
 
+import asyncio
 import json
+import multiprocessing
 import re
+from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -224,3 +227,22 @@ def score_text(response: str, gold_answer: str | None, reward_config: dict) -> f
         return float(bool(prediction and gold and verify(gold[0], prediction[0])))
     except Exception:
         return 0.0
+
+
+@lru_cache(maxsize=1)
+def _reward_executor():
+    # One reusable CPU worker per collector/AgentLoop process. Spawn avoids
+    # inheriting CUDA/Ray state, and math-verify runs on its main thread so its
+    # signal-based timeouts work. Python shuts the executor down on exit.
+    return ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+
+
+def _score_texts(responses, gold_answer, reward_config):
+    return [score_text(response, gold_answer, reward_config) for response in responses]
+
+
+async def score_texts_async(responses, row, *, reward_config):
+    """Score a prefix's completions off the event loop, with working math timeouts."""
+    return await asyncio.get_running_loop().run_in_executor(
+        _reward_executor(), _score_texts, list(responses), row["gold_answer"], dict(reward_config)
+    )

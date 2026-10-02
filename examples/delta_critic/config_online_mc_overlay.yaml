@@ -1,0 +1,24 @@
+# Merge into a synchronous V1 trainer config with algorithm.delta_policy enabled.
+# Preserve actor/reference/scorer paths and the selected_segment critic artifact.
+algorithm:
+  delta_policy:
+    rollout_mode: selected_prefix_mc
+    label_mode: selected_segment
+    mc:
+      continuations_per_state: 16
+      concurrency: 16  # Shared request limit per AgentLoop worker.
+      max_continuation_tokens: 30720
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 20
+      min_p: 0.0
+      save_continuations: true
+      reward:
+        # Re-score the original response AND MC continuations with this contract.
+        # The trainer reward-manager score is retained only as provenance.
+        method: math_verify
+        fallback_on_import_error: false
+    critic_update:
+      epochs: 1
+      microbatch: 1
+      learning_rate: 1.0e-5

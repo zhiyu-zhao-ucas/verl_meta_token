@@ -25,7 +25,7 @@ from pathlib import Path
 
 from .legacy_adapter import adapt_legacy_rows
 from .mc_labeling import MCConfig, label_mc_states_async
-from .sampling_io import load_prompt_rows, score_text
+from .sampling_io import load_prompt_rows, score_text, score_texts_async
 from .state_selection import select_states
 from .v1_sampler import sample_v1_continuations
 
@@ -338,7 +338,7 @@ async def sample_labeled_rollout(
             decode_prefix=lambda ids: tokenizer.decode(ids, skip_special_tokens=False),
             score=lambda response, row: score_text(response, row["gold_answer"], config.get("reward") or {}),
             request_concurrency=mc_concurrency,
-            score_in_thread=score_semaphore is not None,
+            score_batch_async=partial(score_texts_async, reward_config=config.get("reward") or {}),
             score_semaphore=score_semaphore,
             on_label=on_label,
         )

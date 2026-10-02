@@ -1,6 +1,6 @@
 # Delta 训练迁移计划与进度
 
-更新日期：2026-09-28。工作分支：`delta`，从 `main` 创建。
+更新日期：2026-09-30。工作分支：`delta`，从 `main` 创建。
 Last updated: 09/30/2026
 
 本文记录从 `value_model` 向当前 verl 仓库迁移 delta 训练的整体计划、已确认的算法选择、当前实现及待决事项，供后续开发接续。详细接口用法见 [delta 数据契约 README](../examples/delta_critic/README.md)。
@@ -106,7 +106,9 @@ Last updated: 09/30/2026
 
 ### 第 5 部分：delta advantage 与 policy 更新
 
-**状态：仅第 1 部分的纯函数准备完成；训练链路未接入。**
+**状态：policy 实现进行中。共用数据/loss 与交替编排已落盘，离线入口及在线 V1 接入正在实现；验收结果逐项记录，不将接口测试当作真实训练完成。**
+
+2026-09-30 用户确认：**在线 clipping 对本轮 old policy，KL 对固定 reference（默认初始 actor），reference 不随轮次刷新；离线历史复现保持 clipping/KL 共用 behavior anchor。** 在线沿用已确认的 response + balanced MSE critic 和本轮训练集合 advantage 标准化。详细配方和 6–8 月运行对照见 [policy 训练说明](delta_policy_training.md)。
 
 参考源文件：`offline_grpo.py`、`09_train_policy_grpo_offline.py`。
 
@@ -114,7 +116,7 @@ Last updated: 09/30/2026
 
 **5.2 与源算法逐项对齐。**`value_model` 的 `state_only` final 路径用 `state_advantage_source=delta`：每个 selected token 的 raw delta 广播至下一 selected token 之前，保留源 `state_mask`；`ours_local` 的 label 虽是局部差分，learned signal 仍按 segment 广播。`mc_local_oracle` 单独按 selected-token mask 运行，不能复用 learned 广播。将第 1 部分 `state_advantages`、`state_advantage_stats`、`normalize_state_advantages` 的结果与源逐行比对；训练集广播后 active state token 拟合一次 mean/population std，评估和同一训练阶段复用，统计发生在最终 policy mask 与截断之前。在线交替时必须明确“本轮 rollout 训练集合”或其他可复现的拟合范围及何时冻结；没确定范围前不以当前 mini-batch 白化替代。
 
-**5.3 Logprob 和损失映射。**源 `old_logprobs` 是选定的 behavior logprob（stored 或 precomputed），同时是该 final `state_only` loss 中 sampled reverse KL 的参照；其 `clipped_policy_loss` 使用 current/old logprob、advantage 和 `state_mask`。V1 的 `rollout_log_probs` 是生成时 behavior，`old_log_probs` 在默认模式下由当前 actor 重算，bypass mode 才直接取 rollout 值；V1 的 `ref_log_prob` 是另一条 reference-policy 路径。为复现源 final run，应在 delta 配置中显式选择 stored/precomputed behavior 作为 clipping 与 sampled KL 的参照，检查 temperature、token 对齐及缺失 logprob，不将 V1 默认重算结果或 `ref_log_prob` 偷换成源值。先按源公式实现 `state_only` 的 PG clipping 和 sampled reverse KL；若复用 verl 的 `compute_policy_loss_vanilla`，须差分证明 clip、KL 公式、`loss_agg_mode` 与分母相同，不相同则使用专用 loss。源其他 `objective`、KL 参照或 rollout correction 组合需单独配置和验证，不自动宣称等价。
+**5.3 Logprob 和损失映射。**源 `old_logprobs` 是选定的 behavior logprob（stored 或 precomputed），同时是该 final `state_only` loss 中 sampled reverse KL 的参照；其 `clipped_policy_loss` 使用 current/old logprob、advantage 和 `state_mask`。V1 的 `rollout_log_probs` 是生成时 behavior，`old_log_probs` 在默认模式下由当前 actor 重算，bypass mode 才直接取 rollout 值；V1 的 `ref_log_prob` 是另一条 reference-policy 路径。为复现源 final run，应在 delta 配置中显式选择 stored/precomputed behavior 作为 clipping 与 sampled KL 的参照，检查 temperature、token 对齐及缺失 logprob，不将 V1 默认重算结果或 `ref_log_prob` 偷换成源值。先按源公式实现 `state_only` 的 PG clipping 和 sampled reverse KL；若复用 verl 的 `compute_policy_loss_vanilla`，须差分证明 clip、KL 公式、`loss_agg_mode` 与分母相同，不相同则使用专用 loss。离线历史配方使用源 sampled reverse KL（系数 0.01）；在线按用户决定使用固定 reference 的 PPO low_var_kl（可配置初值 0.001），保留 active policy mask。在线每轮刷新 clipping anchor，同轮多个 epoch 固定。当前 vanilla PPO 还包含 dual clip、low_var_kl 最终值 clamp 和默认 token-mean，这些与源不完全一致，专用 loss 分别表达。其他 objective 或 rollout correction 组合不自动宣称等价。
 
 **5.4 Mask 真正进入 actor 更新。**最终 `policy_loss_mask = state_advantage_mask ∩ policy_token_mask ∩ response_valid_mask`。V1 当前 `verl/workers/utils/losses.py::ppo_loss` 使用 `response_mask` 计算 PG、entropy 和 KL，`AgentLoopWorkerTQ` 还把 `loss_mask` 设为 `response_mask`；因此 delta actor loss 必须读取专用 `policy_loss_mask`，使 PG、源所需 KL 和各自分母只计 active token。保留原始 `response_mask` 用于序列有效性和 nested/padded 转换；不要为了筛 token 改写它，也不要只把 masked advantage 置零。对源未使用的 entropy、额外 reference KL、reward-KL、rollout correction 设置显式关闭/兼容条件，防止默认训练配置悄悄改变目标函数。
 
@@ -132,9 +134,9 @@ Last updated: 09/30/2026
 
 ### 第 6 部分：actor–critic 交替迭代
 
-**状态：未实现。**
+**状态：顺序编排与阶段指纹恢复已实现；CPU 模拟两轮测试通过，真实两轮 GPU 验收尚未完成。**
 
-参考源文件：`run_online_iterations.py`。
+入口：`examples/delta_critic/policy_iterations.py`，支持 dry run、固定 reference、按 prompt 划分和阶段恢复。参考源文件：`run_online_iterations.py`。
 
 流程：
 
@@ -549,3 +551,14 @@ tmux new-session -d -s delta_4b_train \
 ```
 
 **状态：配置、数据与启动脚本已就绪；训练尚未执行，冒烟也未跑。**
+
+## 10. 2026-09-30 policy 接入记录
+
+- 已确认在线 KL 固定 reference，离线历史使用 behavior anchor。
+- 已有采样、critic 和文档分阶段提交并推送到 origin/delta（截至 `97a817f8`）；新 policy 工作单独保留。
+- 基线 CPU 含源差分：121 passed。交替编排测试：8 passed（模拟 runner，不代表真实两轮训练）。
+- 旧 checkpoint 缺失 label-mode 现可通过 `--declared-label-mode` 和必填 `--label-mode-source` 显式声明；不覆盖冲突字段，原始 metadata/hash 保留。导入器相关测试 14 passed。
+
+### 本轮交接入口
+
+最新可续作快照见 [Delta policy 训练交接文档](delta_policy_training.md)。独立文件阶段链路已用随机 tiny Qwen 完成两轮真实采样/MC/critic/policy，恢复及独立训练精确 checkpoint 验收见该文档。同步 V1 也已接入 trainer/TQ/FSDP2 actor，并用 [smoke_policy_v1.py](../examples/delta_critic/smoke_policy_v1.py) 在单卡完成两步真实更新；两步 checkpoint 的 actor 参数均有变化。GPU 6、7 上的两卡验收已通过：独立 trainer 与单卡 baseline 的最终参数最大差 `2.4782494e-6`；同步 V1 的两卡单步产生 4 条有效行，重组 checkpoint 后 25/25 个 actor 张量变化。最新 delta 与相关 V1 CPU 回归为 168 passed。同步 V1 精确恢复及正式 8B policy 效果仍未验收。2048-token 窗口仅为历史实验配置，并非用户提出的限制。

@@ -30,7 +30,7 @@ import torch
 import transfer_queue as tq
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tensordict import TensorDict
-from tensordict.tensorclass import NonTensorData
+from tensordict.tensorclass import NonTensorData, NonTensorStack
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transfer_queue import KVBatchMeta
@@ -128,6 +128,16 @@ class PPOTrainer(ABC):
 
         self.trainer_mode = self.config.trainer.v1.trainer_mode
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
+        self.delta_policy_config = None
+        self.delta_policy_settings = None
+        self._delta_policy_scorer = None
+        self._delta_policy_stats = None
+        delta_policy_settings = self.config.algorithm.get("delta_policy", None)
+        if delta_policy_settings is not None and delta_policy_settings.get("enabled", False):
+            from examples.delta_critic.policy_online import validate_online_v1_settings
+
+            self.delta_policy_settings = OmegaConf.to_container(delta_policy_settings, resolve=True)
+            self.delta_policy_config = validate_online_v1_settings(self.config)
         self.replay_buffer = self._build_replay_buffer()
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
             model_config=self.config.actor_rollout_ref.model
@@ -225,6 +235,7 @@ class PPOTrainer(ABC):
 
     def _setup(self):
         self._init_tokenizer()
+        self._init_delta_policy_scorer()
         self._init_dataloader()
         self._init_dump_executor()
         self._init_resource_pool_mgr()
@@ -327,6 +338,10 @@ class PPOTrainer(ABC):
         # 6. initialize actor and ref model engine
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
+        if self.delta_policy_config is not None:
+            from examples.delta_critic.policy_loss import delta_policy_loss
+
+            self.actor_rollout_wg.set_loss_fn(delta_policy_loss)
         logger.info("actor and ref model engine initialized")
 
         if self.use_reference_policy and not self.ref_in_actor:
@@ -531,7 +546,10 @@ class PPOTrainer(ABC):
         self._shutdown_dump_executor()
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
-        train_batch_size = self.config.data.train_batch_size
+        expansion = (self.delta_policy_settings or {}).get("expansion", {})
+        train_batch_size = (
+            expansion["prompts_per_step"] if expansion.get("enabled", False) else self.config.data.train_batch_size
+        )
         assert train_batch_size % self.parameter_sync_step == 0, (
             f"train_batch_size ({train_batch_size}) must be divisible by "
             f"parameter_sync_step ({self.parameter_sync_step})"
@@ -572,6 +590,12 @@ class PPOTrainer(ABC):
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
+        expansion = (self.delta_policy_settings or {}).get("expansion", {})
+        if expansion.get("enabled", False):
+            expected = self.config.data.train_batch_size
+            real = sum(not tag.get("is_padding", False) for tag in batch.tags)
+            if real != expected:
+                raise ValueError(f"Expansion budget requires exactly {expected} trajectories, got {real}")
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -705,6 +729,32 @@ class PPOTrainer(ABC):
         # Used for multimodal LLM, could be None
         self.processor = model_config.processor
 
+    def _init_delta_policy_scorer(self):
+        """Load the delta critic before any policy data is collected."""
+        if self.delta_policy_config is None:
+            return
+
+        from examples.delta_critic.checkpoint import tokenizer_fingerprint_from_tokenizer
+        from examples.delta_critic.policy_online import (
+            create_frozen_delta_scorer,
+            validate_online_scorer_contract,
+        )
+
+        tokenizer_sha256 = tokenizer_fingerprint_from_tokenizer(self.tokenizer)
+        scorer = create_frozen_delta_scorer(self.delta_policy_settings)
+        validate_online_scorer_contract(
+            scorer,
+            tokenizer_sha256=tokenizer_sha256,
+            label_mode=self.delta_policy_settings["label_mode"],
+        )
+        self._delta_policy_scorer = scorer
+        logger.info(
+            "Loaded delta scorer %s (critic=%s, label_mode=%s)",
+            scorer.metadata.get("weights_sha256"),
+            self.delta_policy_settings["critic_artifact"],
+            self.delta_policy_settings["label_mode"],
+        )
+
     def _init_dataloader(self):
         """Initialize train and validate dataloader."""
         self.train_dataset = create_rl_dataset(
@@ -762,7 +812,9 @@ class PPOTrainer(ABC):
             f"{len(self.train_dataset)}, val dataset size: {len(self.val_dataset)}"
         )
 
-        self.steps_per_epoch = len(self.train_dataset) // self.config.data.train_batch_size
+        expansion = (getattr(self, "delta_policy_settings", None) or {}).get("expansion", {})
+        prompt_batch_size = expansion.get("prompts_per_step") if expansion.get("enabled", False) else None
+        self.steps_per_epoch = len(self.train_dataset) // (prompt_batch_size or self.config.data.train_batch_size)
 
         # adjust total_training_steps
         total_training_steps = self.steps_per_epoch * self.config.trainer.total_epochs
@@ -889,6 +941,15 @@ class PPOTrainer(ABC):
                 del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
 
+        if (
+            self.delta_policy_settings
+            and self.delta_policy_settings.get("rollout_mode") == "selected_prefix_mc"
+            and not self.delta_policy_settings.get("expansion", {}).get("enabled", False)
+        ):
+            self._delta_policy_scorer.load_online(
+                os.path.join(global_step_folder, "delta_critic.pt"), self.global_steps
+            )
+
         # 4. load dataloader checkpoint
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
@@ -1005,6 +1066,15 @@ class PPOTrainer(ABC):
             tq.save_checkpoint(
                 os.path.join(local_global_step_folder, "transfer_queue"),
                 metadata={"global_steps": self.global_steps},
+            )
+
+        if (
+            self.delta_policy_settings
+            and self.delta_policy_settings.get("rollout_mode") == "selected_prefix_mc"
+            and not self.delta_policy_settings.get("expansion", {}).get("enabled", False)
+        ):
+            self._delta_policy_scorer.save_online(
+                os.path.join(local_global_step_folder, "delta_critic.pt"), self.global_steps
             )
 
         # write latest checkpointed iteration tracker for atomic resume
@@ -1298,6 +1368,12 @@ class PPOTrainer(ABC):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            collect_mc = (
+                self.delta_policy_settings is not None
+                and self.delta_policy_settings.get("rollout_mode", "critic_prediction") == "selected_prefix_mc"
+            )
+            if collect_mc:
+                fields.append("delta_mc_record")
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
@@ -1329,6 +1405,11 @@ class PPOTrainer(ABC):
             scores = [scores[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            if collect_mc:
+                from examples.delta_critic.policy_mc import mc_record_rows
+
+                records = mc_record_rows(data["delta_mc_record"])
+                reward_extra_infos_dict["delta_mc_record"] = [records[i] for i in sorted_indices]
 
             self._dump_generations(
                 inputs=inputs,
@@ -1523,7 +1604,19 @@ class PPOTrainer(ABC):
         self._submit_batch_to_rollout(batch)
 
     def prepare_step(self) -> dict:
-        self._add_batch_to_generate()
+        expansion = (self.delta_policy_settings or {}).get("expansion", {})
+        if expansion.get("enabled", False):
+            prompt_count = expansion["prompts_per_step"]
+            state_count = expansion["states_per_step"]
+            batch = self._next_train_batch(prompt_count)
+            # Rotate assignments so the same dataloader positions are not
+            # always selected for the extra generation budget.
+            start = (self.global_steps - 1) * state_count % prompt_count
+            selected = {(start + offset) % prompt_count for offset in range(state_count)}
+            batch["delta_expand"] = torch.tensor([i in selected for i in range(prompt_count)], dtype=torch.bool)
+            self._submit_batch_to_rollout(batch)
+        else:
+            self._add_batch_to_generate()
         return {}
 
     def _compute_reward_colocate(self, batch: KVBatchMeta, metrics: dict | None = None) -> KVBatchMeta:
@@ -1631,8 +1724,106 @@ class PPOTrainer(ABC):
         metrics.update(global_balance_stats)
         return batch
 
+    @staticmethod
+    def _tq_field_rows(value) -> list:
+        """Convert one TransferQueue batched field into its per-row Python values."""
+        if isinstance(value, torch.Tensor):
+            if value.is_nested:
+                return [row.tolist() for row in value.unbind()]
+            if value.ndim == 0:
+                return [value.item()]
+            return value.tolist()
+        if hasattr(value, "tolist"):
+            return value.tolist()
+        if isinstance(value, list | tuple):
+            return list(value)
+        raise TypeError(f"Unsupported TransferQueue field type: {type(value).__name__}")
+
+    def _validate_delta_rollout_versions(self, batch: KVBatchMeta) -> None:
+        """Require the synchronous rollouts to use the actor snapshot being frozen as old policy."""
+        expected_version = self.global_steps - 1
+        data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["rollout_actor_version"],
+        )
+        versions = self._tq_field_rows(data["rollout_actor_version"])
+        if len(versions) != len(batch):
+            raise ValueError("Online delta rollout actor-version rows do not match the sampled batch")
+        for key, tag, version in zip(batch.keys, batch.tags, versions, strict=True):
+            if tag.get("is_padding", False):
+                continue
+            min_version = tag.get("min_global_steps")
+            max_version = tag.get("max_global_steps")
+            if version != expected_version or min_version != expected_version or max_version != expected_version:
+                raise ValueError(
+                    "Online delta policy requires each rollout to use the pre-update actor snapshot "
+                    f"at version {expected_version}; row={key}, field_version={version}, "
+                    f"tag_versions=[{min_version}, {max_version}]"
+                )
+
+    @staticmethod
+    def _short_response_reward_deltas(
+        batch: KVBatchMeta, data, *, short_response_budget: int | None
+    ) -> dict[str, float]:
+        """Rows short enough that the realized reward replaces the critic prediction.
+
+        The budget is compared against ``delta_reward_text_length``, which counts a
+        continuation together with its prefix. Returns an empty mapping when the
+        rule is disabled, so the caller can pass it through unconditionally.
+        """
+        if short_response_budget is None:
+            return {}
+        rewards = PPOTrainer._tq_field_rows(data["delta_true_reward"])
+        lengths = PPOTrainer._tq_field_rows(data["delta_reward_text_length"])
+        if len(rewards) != len(batch) or len(lengths) != len(batch):
+            raise ValueError("Short-response delta fields do not match the sampled batch")
+        selected = {}
+        for key, tag, reward, length in zip(batch.keys, batch.tags, rewards, lengths, strict=True):
+            if tag.get("is_padding", False):
+                continue
+            if isinstance(length, bool) or not isinstance(length, int) or length < 1:
+                raise ValueError(f"Short-response delta length must be a positive integer for row {key}")
+            value = float(reward)
+            if not math.isfinite(value):
+                raise ValueError(f"Short-response delta reward must be finite for row {key}")
+            if length <= short_response_budget:
+                selected[key] = value
+        return selected
+
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
+        if self.delta_policy_config is not None:
+            self._validate_delta_rollout_versions(batch)
+            temperature = self.delta_policy_config.train_logprob_temperature
+            batch.extra_info.update(
+                {
+                    "calculate_entropy": False,
+                    "compute_loss": False,
+                    "temperature": temperature,
+                }
+            )
+            output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
+            if len(output) != len(batch):
+                raise ValueError("Pre-update actor logprob output does not match the sampled delta batch")
+            data = tq.kv_batch_get(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                select_fields=["log_probs", "response_mask"],
+            )
+            old_log_probs = response_from_nested(data.pop("log_probs"), data["response_mask"])
+            expected_version = self.global_steps - 1
+            fields = TensorDict(
+                {
+                    "old_log_probs": old_log_probs,
+                    "old_logprob_source": NonTensorStack(*(["actor_snapshot"] * len(batch))),
+                    "old_logprob_temperature": torch.full((len(batch),), temperature, dtype=torch.float32),
+                    "old_logprob_actor_version": torch.full((len(batch),), expected_version, dtype=torch.int64),
+                },
+                batch_size=[len(batch)],
+            )
+            return tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=fields)
+
         # Operating Mode Selection:
         # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
         # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1698,7 +1889,11 @@ class PPOTrainer(ABC):
         metadata = {
             "calculate_entropy": False,
             "compute_loss": False,
-            "temperature": self.config.actor_rollout_ref.rollout.temperature,
+            "temperature": (
+                self.delta_policy_config.train_logprob_temperature
+                if self.delta_policy_config is not None
+                else self.config.actor_rollout_ref.rollout.temperature
+            ),
         }
         if self.ref_in_actor:
             metadata["no_lora_adapter"] = True
@@ -1714,7 +1909,22 @@ class PPOTrainer(ABC):
             keys=batch.keys, partition_id=batch.partition_id, select_fields=["log_probs", "response_mask"]
         )
         data["ref_log_prob"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
-        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("ref_log_prob"))
+        if self.delta_policy_config is not None:
+            temperature = self.delta_policy_config.train_logprob_temperature
+            data["ref_logprob_source"] = NonTensorStack(*(["fixed_reference"] * len(batch)))
+            data["ref_logprob_temperature"] = torch.full((len(batch),), temperature, dtype=torch.float32)
+            data["delta_reference_policy_id"] = NonTensorStack(
+                *([self.delta_policy_settings["reference_policy_id"]] * len(batch))
+            )
+            ref_fields = data.select(
+                "ref_log_prob",
+                "ref_logprob_source",
+                "ref_logprob_temperature",
+                "delta_reference_policy_id",
+            )
+        else:
+            ref_fields = data.select("ref_log_prob")
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=ref_fields)
 
         return batch
 
@@ -1742,6 +1952,9 @@ class PPOTrainer(ABC):
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
+        if self.delta_policy_config is not None:
+            return self._compute_delta_policy_advantage(batch, metrics)
+
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
@@ -1801,6 +2014,311 @@ class PPOTrainer(ABC):
 
         return batch
 
+    def _compute_delta_policy_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Score and normalize one complete synchronous policy batch before any PPO epoch."""
+        if self._delta_policy_scorer is None:
+            raise RuntimeError("Online delta scorer was not initialized")
+        self._validate_delta_rollout_versions(batch)
+        fields = [
+            "prompts",
+            "responses",
+            "response_mask",
+            "policy_token_mask",
+            "selected_token_indices",
+            "delta_top_logprobs",
+            "old_log_probs",
+            "ref_log_prob",
+            "rm_scores",
+        ]
+        expansion = self.delta_policy_settings.get("expansion", {})
+        continuation_actor_loss = expansion.get("continuation_actor_loss", True)
+        short_response_budget = expansion.get("short_response_tokens") if expansion.get("enabled", False) else None
+        if expansion.get("enabled", False):
+            fields.append("delta_is_continuation")
+            if short_response_budget is not None:
+                fields.extend(["delta_true_reward", "delta_reward_text_length"])
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        continuation_flags = (
+            [bool(v) for v in self._tq_field_rows(data["delta_is_continuation"])]
+            if expansion.get("enabled", False)
+            else [False] * len(batch)
+        )
+        reward_deltas_by_id = self._short_response_reward_deltas(
+            batch, data, short_response_budget=short_response_budget
+        )
+        prompts = self._tq_field_rows(data["prompts"])
+        responses = self._tq_field_rows(data["responses"])
+        response_masks = self._tq_field_rows(data["response_mask"])
+        policy_masks = self._tq_field_rows(data["policy_token_mask"])
+        selected_indices = self._tq_field_rows(data["selected_token_indices"])
+        top_logprobs = self._tq_field_rows(data["delta_top_logprobs"])
+        behavior_logprobs = self._tq_field_rows(data["old_log_probs"])
+        reference_logprobs = self._tq_field_rows(data["ref_log_prob"])
+        reward_scores = self._tq_field_rows(data["rm_scores"])
+        row_ids, real_positions = [], []
+
+        expected_version = self.global_steps - 1
+        for index, (key, tag, response, response_mask, policy_mask, selected, top_rows) in enumerate(
+            zip(
+                batch.keys,
+                batch.tags,
+                responses,
+                response_masks,
+                policy_masks,
+                selected_indices,
+                top_logprobs,
+                strict=True,
+            )
+        ):
+            if tag.get("is_padding", False):
+                continue
+            if len(top_rows) != len(response):
+                raise ValueError(
+                    "vLLM top-logprob rows do not align with response tokens after continuous-token merging "
+                    f"for row {key}: {len(top_rows)} vs {len(response)}"
+                )
+            if len(response_mask) != len(response) or len(policy_mask) != len(response):
+                raise ValueError(f"Response and policy masks do not align with response tokens for row {key}")
+            if len(selected) != len(set(selected)) or selected != sorted(selected):
+                raise ValueError(f"Selected token indices must be unique and sorted for row {key}")
+            if any(index < 0 or index >= len(response) for index in selected):
+                raise ValueError(f"Selected token index is outside the response for row {key}")
+            if any(value not in (0, 1) for value in response_mask + policy_mask):
+                raise ValueError(f"Response and policy masks must be binary for row {key}")
+            if continuation_flags[index] and not selected:
+                raise ValueError(f"Delta-scored continuation has no selected state for row {key}")
+            row_ids.append(key)
+            real_positions.append(index)
+
+        if not row_ids:
+            raise ValueError("Online delta policy sampled no real trajectories")
+        if expansion.get("enabled", False):
+            originals = sum(not continuation_flags[index] for index in real_positions)
+            continuations = sum(
+                flag and not tag.get("is_padding", False)
+                for flag, tag in zip(continuation_flags, batch.tags, strict=True)
+            )
+            expected_continuations = (
+                expansion["states_per_step"] * self.delta_policy_settings["mc"]["continuations_per_state"]
+            )
+            if originals != expansion["prompts_per_step"] or continuations != expected_continuations:
+                raise ValueError(f"Expansion batch incomplete: originals={originals}, continuations={continuations}")
+        from examples.delta_critic.policy_online import delta_examples_from_rows
+
+        examples = delta_examples_from_rows(
+            row_ids,
+            [prompts[index] for index in real_positions],
+            [responses[index] for index in real_positions],
+            [policy_masks[index] for index in real_positions],
+            [selected_indices[index] for index in real_positions],
+            actor_version=str(expected_version),
+        )
+        scored = self._delta_policy_scorer.score(examples)
+        selected_by_id = {key: selected_indices[index] for key, index in zip(row_ids, real_positions, strict=True)}
+        raw_predictions_by_id = {}
+        for example, result in zip(examples, scored, strict=True):
+            raw_predictions_by_id[example.rollout.rollout_id] = {
+                token_index: result["delta_pred_raw"][token_index]
+                for token_index in selected_by_id[example.rollout.rollout_id]
+            }
+
+        behavior_by_id = {key: behavior_logprobs[index] for key, index in zip(row_ids, real_positions, strict=True)}
+        reference_by_id = {key: reference_logprobs[index] for key, index in zip(row_ids, real_positions, strict=True)}
+        row_weights = {
+            key: float(not continuation_flags[index] or continuation_actor_loss)
+            for key, index in zip(row_ids, real_positions, strict=True)
+        }
+        from examples.delta_critic.policy_data import prepare_policy_rows
+
+        fixed_stats = self.delta_policy_settings.get("advantage_stats_mode", "per_rollout") == "initial_rollout"
+        stats = getattr(self, "_delta_policy_stats", None) if fixed_stats else None
+        if fixed_stats:
+            from examples.delta_critic.policy_online import initial_advantage_stats
+
+            stats_path = os.path.join(self.config.trainer.default_local_dir, "delta_advantage_stats.json")
+            stats_identity = {
+                "reference_policy_id": self.delta_policy_settings["reference_policy_id"],
+                "critic_weights_sha256": self._delta_policy_scorer.metadata["weights_sha256"],
+                "label_mode": self.delta_policy_config.label_mode,
+            }
+            contract = None
+            if expansion.get("enabled", False):
+                contract = "delta_originals_and_continuations_v1"
+                if not continuation_actor_loss:
+                    contract = "delta_originals_only_v1"
+            modifiers = []
+            if short_response_budget is not None:
+                modifiers.append(f"short_reward_le{short_response_budget}")
+            if self.delta_policy_config.advantage_clip is not None:
+                modifiers.append(f"advantage_clip_{self.delta_policy_config.advantage_clip}")
+            if modifiers:
+                contract = ":".join([part for part in (contract, "+".join(modifiers)) if part])
+            if contract is not None:
+                stats_identity["advantage_contract"] = contract
+            stats = initial_advantage_stats(stats_path, **stats_identity, stats=stats)
+            if stats is None and self.global_steps != 1:
+                raise ValueError("Missing initial advantage statistics: refusing to recalibrate a resumed policy")
+
+        prepared_rows, stats = prepare_policy_rows(
+            examples,
+            raw_predictions_by_id,
+            behavior_by_id,
+            self.delta_policy_config,
+            reference_logprobs_by_id=reference_by_id,
+            reference_policy_id=self.delta_policy_settings["reference_policy_id"],
+            row_weights_by_id=row_weights,
+            stats=stats,
+            fit_stats=self.delta_policy_config.advantage_normalization == "standardize" and stats is None,
+            reward_deltas_by_id=reward_deltas_by_id,
+        )
+        if fixed_stats:
+            initial_advantage_stats(stats_path, **stats_identity, stats=stats)
+        if self.delta_policy_config.advantage_clip is not None:
+            metrics["delta_policy/advantage_clip"] = float(self.delta_policy_config.advantage_clip)
+            metrics["delta_policy/clipped_advantage_tokens"] = sum(
+                row.get("advantage_clip_count", 0) for row in prepared_rows
+            )
+        prepared_by_id = {row["id"]: row for row in prepared_rows}
+        scored_by_id = {row["rollout_id"]: row for row in scored}
+
+        output_advantages = []
+        output_state_masks = []
+        output_policy_masks = []
+        output_kl_masks = []
+        output_critic_masks = []
+        output_critic_predictions = []
+        output_selected_indices = []
+        output_values = []
+        output_returns = []
+        output_rewards = []
+        output_row_weights = []
+        output_sample_valid = []
+        for index, tag in enumerate(batch.tags):
+            response_length = len(responses[index])
+            if tag.get("is_padding", False):
+                zeros = [0.0] * response_length
+                output_advantages.append(zeros)
+                output_state_masks.append(zeros)
+                output_policy_masks.append(zeros)
+                output_kl_masks.append(zeros)
+                output_critic_masks.append(zeros)
+                output_critic_predictions.append(zeros)
+                output_selected_indices.append([])
+                output_row_weights.append(0.0)
+                output_sample_valid.append(0.0)
+            else:
+                key = batch.keys[index]
+                row = prepared_by_id[key]
+                prediction = scored_by_id[key]
+                mask = row["policy_loss_mask"] if row_weights[key] else [0.0] * response_length
+                output_advantages.append(row["advantages"])
+                output_state_masks.append(row["state_mask"])
+                output_policy_masks.append(mask)
+                output_kl_masks.append(mask)
+                output_critic_masks.append(prediction["critic_signal_mask"])
+                output_critic_predictions.append(prediction["delta_pred_raw"])
+                output_selected_indices.append(selected_indices[index])
+                # Keep the original 320-row loss denominator. Disabling
+                # continuation loss only removes its PG/KL numerator terms.
+                output_row_weights.append(1.0)
+                output_sample_valid.append(1.0)
+            output_values.append([0.0] * response_length)
+            output_returns.append([0.0] * response_length)
+            output_rewards.append([float(value) for value in reward_scores[index]])
+
+        def nested_rows(rows, dtype):
+            return torch.nested.as_nested_tensor([torch.tensor(row, dtype=dtype) for row in rows], layout=torch.jagged)
+
+        fields = TensorDict(
+            {
+                "advantages": nested_rows(output_advantages, torch.float32),
+                "returns": nested_rows(output_returns, torch.float32),
+                "values": nested_rows(output_values, torch.float32),
+                "token_level_rewards": nested_rows(output_rewards, torch.float32),
+                "state_mask": nested_rows(output_state_masks, torch.float32),
+                "policy_loss_mask": nested_rows(output_policy_masks, torch.float32),
+                "kl_mask": nested_rows(output_kl_masks, torch.float32),
+                "critic_signal_mask": nested_rows(output_critic_masks, torch.float32),
+                "delta_pred_raw": nested_rows(output_critic_predictions, torch.float32),
+                "selected_token_indices": nested_rows(output_selected_indices, torch.int64),
+                "delta_top_logprobs": NonTensorStack(*([[] for _ in range(len(batch))])),
+                "delta_reference_policy_id": NonTensorStack(
+                    *([self.delta_policy_settings["reference_policy_id"]] * len(batch))
+                ),
+                "row_weight": torch.tensor(output_row_weights, dtype=torch.float32),
+                "sample_valid_mask": torch.tensor(output_sample_valid, dtype=torch.float32),
+            },
+            batch_size=[len(batch)],
+        )
+        batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=fields)
+        self._delta_policy_stats = stats
+        if stats is not None:
+            metrics.update(
+                {
+                    "delta_policy/advantage_stats_count": stats.count,
+                    "delta_policy/advantage_stats_mean": stats.mean,
+                    "delta_policy/advantage_stats_std": stats.std,
+                }
+            )
+        metrics["delta_policy/reference_policy_id_present"] = 1.0
+        metrics["delta_policy/advantage_stats_fixed"] = float(fixed_stats)
+        batch.extra_info["delta_policy_config"] = self.delta_policy_config.as_dict()
+        batch.extra_info["delta_policy_reference_policy_id"] = self.delta_policy_settings["reference_policy_id"]
+        if self.delta_policy_settings.get("rollout_mode") == "selected_prefix_mc":
+            # Policy advantages have already been materialized in TQ. Fitting
+            # the critic here must never replace those pre-fit predictions.
+            mc_data = tq.kv_batch_get(
+                keys=batch.keys, partition_id=batch.partition_id, select_fields=["delta_mc_record"]
+            )
+            from examples.delta_critic.policy_mc import export_mc_attempt, mc_record_rows
+
+            records = mc_record_rows(mc_data["delta_mc_record"])
+            original_positions = [index for index in real_positions if not continuation_flags[index]]
+            real_records = [records[index] for index in original_positions]
+            if expansion.get("enabled", False):
+                state_count = sum(len(record["states"]) for record in real_records)
+                continuation_count = sum(
+                    len(label.get("mc_continuations", [])) for record in real_records for label in record["labels"]
+                )
+                if state_count != expansion["states_per_step"] or continuation_count != expected_continuations:
+                    raise ValueError(
+                        f"Expansion export incomplete: states={state_count}, continuations={continuation_count}"
+                    )
+            for index, record in zip(original_positions, real_records, strict=True):
+                rollout = record["rollout"]
+                if (
+                    rollout["prompt_token_ids"] != prompts[index]
+                    or rollout["response_token_ids"] != responses[index]
+                    or rollout["actor_version"] != str(expected_version)
+                    or not set(state["token_index"] for state in record["states"]).issubset(selected_indices[index])
+                ):
+                    raise ValueError("MC record does not match its sampled policy trajectory")
+            export_mc_attempt(
+                real_records,
+                os.path.join(self.config.trainer.default_local_dir, "mc_data", f"step_{self.global_steps:08d}"),
+            )
+            if expansion.get("enabled", False):
+                metrics["delta_policy/original_rows"] = len(real_records)
+                metrics["delta_policy/continuation_rows"] = continuations
+                metrics["delta_policy/continuation_actor_loss_enabled"] = float(continuation_actor_loss)
+                metrics["delta_policy/actor_loss_continuation_rows"] = continuations if continuation_actor_loss else 0
+                metrics["delta_policy/continuation_advantage_from_critic"] = 1.0
+                metrics["delta_critic/update_step"] = 0
+                if short_response_budget is not None:
+                    substituted = [reward_deltas_by_id[key] for key in row_ids if key in reward_deltas_by_id]
+                    metrics["delta_policy/short_response_tokens"] = short_response_budget
+                    metrics["delta_policy/short_response_rows"] = len(substituted)
+                    metrics["delta_policy/short_response_positive_rows"] = sum(
+                        1 for value in substituted if value > 0.0
+                    )
+                    metrics["delta_policy/short_response_mean_reward"] = (
+                        sum(substituted) / len(substituted) if substituted else 0.0
+                    )
+            else:
+                metrics["delta_critic/prediction_update_step"] = self._delta_policy_scorer.update_step
+                metrics.update(self._delta_policy_scorer.fit_mc(real_records))
+        return batch
+
     def _update_critic(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the critic network."""
         ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
@@ -1828,8 +2346,11 @@ class PPOTrainer(ABC):
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
-        calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
-            self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+        calculate_entropy = (
+            False
+            if self.delta_policy_config is not None
+            else self.config.actor_rollout_ref.actor.calculate_entropy
+            or self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
@@ -1853,8 +2374,15 @@ class PPOTrainer(ABC):
             "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
             "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
-            "temperature": self.config.actor_rollout_ref.rollout.temperature,
+            "temperature": (
+                self.delta_policy_config.train_logprob_temperature
+                if self.delta_policy_config is not None
+                else self.config.actor_rollout_ref.rollout.temperature
+            ),
         }
+        if self.delta_policy_config is not None:
+            extra_info["delta_policy_config"] = self.delta_policy_config.as_dict()
+            extra_info["delta_policy_reference_policy_id"] = self.delta_policy_settings["reference_policy_id"]
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)

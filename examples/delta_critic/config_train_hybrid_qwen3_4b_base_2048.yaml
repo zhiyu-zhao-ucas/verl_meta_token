@@ -1,0 +1,25 @@
+# Offline critic recipe for budgeted 4B policy-expansion collections.
+# Keep collection and critic fitting as separate jobs. The CLI must supply
+# the effective global batch and update budget after choosing round attempts.
+model_path: Qwen/Qwen3-4B-Base
+dtype: bfloat16
+attention_implementation: sdpa
+value_layer: -1
+objective: hybrid_terminal_composition
+loss_type: nonzero_balanced_mse
+loss_mask: response
+delta_label_mode: selected_segment
+target_normalization: standardize
+# Prompt <= 2048 and response prefix + continuation <= 2048.
+max_length: 4096
+window_policy: full
+gradient_checkpointing: true
+learning_rate: 1.0e-5
+weight_decay: 0.0
+gradient_clip: 1.0
+seed: 42
+td_weight: 1.0
+terminal_weight: 1.0
+continuation_state_count: 64
+continuation_min_gap: 32
+continuation_budget: 8

@@ -37,6 +37,7 @@ class MCRequest:
 class MCContinuation:
     token_ids: tuple[int, ...]
     text: str
+    delta_top_logprobs: list[list[dict[str, Any]]] | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,9 @@ class MCConfig:
     assume_legacy_last_token_terminal: bool = False
     save_individual_rewards: bool = False
     save_continuations: bool = False
+    max_total_tokens: int | None = None
+    max_response_total_tokens: int | None = None
+    require_nonempty: bool = False
 
     def __post_init__(self):
         if self.mode not in {"prefix_only", "paired_next_state"}:
@@ -66,6 +70,18 @@ class MCConfig:
             raise ValueError("MC sampling_config.n must be 1; budget is continuations_per_state")
         if not isinstance(self.continuation_skip_special_tokens, bool):
             raise ValueError("continuation_skip_special_tokens must be explicitly set")
+        if self.max_total_tokens is not None and (
+            isinstance(self.max_total_tokens, bool)
+            or not isinstance(self.max_total_tokens, int)
+            or self.max_total_tokens < 1
+        ):
+            raise ValueError("max_total_tokens must be a positive integer")
+        if self.max_response_total_tokens is not None and (
+            isinstance(self.max_response_total_tokens, bool)
+            or not isinstance(self.max_response_total_tokens, int)
+            or self.max_response_total_tokens < 1
+        ):
+            raise ValueError("max_response_total_tokens must be a positive integer")
 
 
 def build_mc_requests(
@@ -168,6 +184,11 @@ def label_mc_states(
                         "token_ids": list(continuation.token_ids),
                         "text": continuation.text,
                         "reward": reward,
+                        **(
+                            {"delta_top_logprobs": continuation.delta_top_logprobs}
+                            if continuation.delta_top_logprobs is not None
+                            else {}
+                        ),
                     }
                 )
         values[request] = (sum(rewards) / len(rewards), rewards, empty, records)
@@ -185,9 +206,16 @@ async def label_mc_states_async(
     request_concurrency: int = 1,
     score_in_thread: bool = False,
     score_semaphore: asyncio.Semaphore | None = None,
+    score_batch_async: Callable[[list[str], dict[str, Any]], Awaitable[Sequence[float]]] | None = None,
     on_label: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
-    """Async variant for the V1 LLM server client."""
+    """Async variant for the V1 LLM server client.
+
+    Signal-based scorers must use a process-backed ``score_batch_async``;
+    ``score_in_thread`` is only suitable for thread-safe scoring functions.
+    """
+    if score_batch_async is not None and score_in_thread:
+        raise ValueError("score_batch_async and score_in_thread are mutually exclusive")
     rollouts = list(rollouts)
     states = list(states)
     requests, links = build_mc_requests(rollouts, states, config)
@@ -200,13 +228,29 @@ async def label_mc_states_async(
         if len(continuations) != config.continuations_per_state:
             raise ValueError("MC sampler returned a count different from continuations_per_state")
 
+        async_rewards = None
+        if score_batch_async is not None:
+            prefix_text = decode_prefix(request.prefix_response_token_ids)
+            texts = [prefix_text + continuation.text for continuation in continuations]
+            if score_semaphore is None:
+                async_rewards = list(await score_batch_async(texts, rollout_map[request.rollout_id]))
+            else:
+                async with score_semaphore:
+                    async_rewards = list(await score_batch_async(texts, rollout_map[request.rollout_id]))
+            if len(async_rewards) != len(continuations):
+                raise ValueError("MC scorer returned a count different from continuations")
+
         def score_continuations():
             prefix_text = decode_prefix(request.prefix_response_token_ids)
             rewards = []
             empty = 0
             records = []
             for continuation_index, continuation in enumerate(continuations):
-                reward = float(score(prefix_text + continuation.text, rollout_map[request.rollout_id]))
+                reward = float(
+                    async_rewards[continuation_index]
+                    if async_rewards is not None
+                    else score(prefix_text + continuation.text, rollout_map[request.rollout_id])
+                )
                 if not isfinite(reward):
                     raise ValueError("MC reward must be finite")
                 rewards.append(reward)
@@ -218,6 +262,11 @@ async def label_mc_states_async(
                             "token_ids": list(continuation.token_ids),
                             "text": continuation.text,
                             "reward": reward,
+                            **(
+                                {"delta_top_logprobs": continuation.delta_top_logprobs}
+                                if continuation.delta_top_logprobs is not None
+                                else {}
+                            ),
                         }
                     )
             return sum(rewards) / len(rewards), rewards, empty, records
@@ -277,7 +326,37 @@ def _assemble_labels(rollouts, states, config, links, values):
             "v_prefix": value,
             "mc_num_samples": len(rewards),
             "mc_empty_continuations": empty,
-            "mc_sampling_config": dict(config.sampling_config),
+            "mc_sampling_config": {
+                **config.sampling_config,
+                **(
+                    {
+                        "max_response_total_tokens": config.max_response_total_tokens,
+                        "effective_max_response_tokens": max(
+                            0,
+                            min(
+                                config.sampling_config["max_tokens"],
+                                config.max_response_total_tokens - len(before.prefix_response_token_ids),
+                            ),
+                        ),
+                    }
+                    if config.max_response_total_tokens is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "max_total_tokens": config.max_total_tokens,
+                        "effective_max_tokens": max(
+                            0,
+                            min(
+                                config.sampling_config["max_tokens"],
+                                config.max_total_tokens - len(before.input_ids),
+                            ),
+                        ),
+                    }
+                    if config.max_total_tokens is not None
+                    else {}
+                ),
+            },
             "mc_actor_version": config.actor_version,
             "mc_continuation_skip_special_tokens": config.continuation_skip_special_tokens,
         }

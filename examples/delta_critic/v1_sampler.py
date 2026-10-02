@@ -37,7 +37,22 @@ async def sample_v1_continuations(
     """
     if native_n_batch_size is not None and native_n_batch_size < 1:
         raise ValueError("native_n_batch_size must be positive")
+    if native_n_batch_size is not None and config.sampling_config.get("delta_top_logprobs") is not None:
+        raise ValueError("Delta-scored continuations require individual requests with token-aligned top logprobs")
     semaphore = request_semaphore or asyncio.Semaphore(config.continuations_per_state)
+    max_tokens = config.sampling_config["max_tokens"]
+    if config.max_total_tokens is not None:
+        max_tokens = min(max_tokens, config.max_total_tokens - len(request.input_ids))
+    if config.max_response_total_tokens is not None:
+        max_tokens = min(max_tokens, config.max_response_total_tokens - len(request.prefix_response_token_ids))
+    if max_tokens <= 0:
+        return [MCContinuation((), "") for _ in range(config.continuations_per_state)]
+    sampling_params = {**config.sampling_config, "max_tokens": max_tokens}
+
+    def checked_tokens(token_ids):
+        if len(token_ids) > max_tokens:
+            raise ValueError("MC continuation exceeded the prefix-inclusive token cap")
+        return tuple(token_ids)
 
     if native_n_batch_size is not None:
 
@@ -48,14 +63,14 @@ async def sample_v1_continuations(
                     request_id=f"delta-mc:{config.actor_version}:{request.rollout_id}:"
                     f"{len(request.prefix_response_token_ids)}:{start}",
                     prompt_ids=list(request.input_ids),
-                    sampling_params={**config.sampling_config, "delta_mc_n": count},
+                    sampling_params={**sampling_params, "delta_mc_n": count},
                 )
             rows = (output.extra_fields or {}).get("delta_mc_token_ids")
             if not isinstance(rows, list) or len(rows) != count:
                 raise ValueError("V1 backend must return every delta_mc_n continuation")
             return [
                 MCContinuation(
-                    tuple(token_ids),
+                    checked_tokens(token_ids),
                     tokenizer.decode(token_ids, skip_special_tokens=config.continuation_skip_special_tokens),
                 )
                 for token_ids in rows
@@ -70,17 +85,32 @@ async def sample_v1_continuations(
         return continuations
 
     async def generate_one(sample_index: int) -> MCContinuation:
-        async with semaphore:
-            output = await server_client.generate(
-                request_id=f"delta-mc:{config.actor_version}:{request.rollout_id}:"
-                f"{len(request.prefix_response_token_ids)}:{sample_index}",
-                prompt_ids=list(request.input_ids),
-                sampling_params=dict(config.sampling_config),
+        for attempt in range(4):
+            request_id = (
+                f"delta-mc:{config.actor_version}:{request.rollout_id}:"
+                f"{len(request.prefix_response_token_ids)}:{sample_index}"
             )
-        token_ids = tuple(output.token_ids)
-        return MCContinuation(
-            token_ids, tokenizer.decode(token_ids, skip_special_tokens=config.continuation_skip_special_tokens)
-        )
+            if config.require_nonempty:
+                request_id += f":attempt{attempt}"
+            async with semaphore:
+                output = await server_client.generate(
+                    request_id=request_id,
+                    prompt_ids=list(request.input_ids),
+                    sampling_params=dict(sampling_params),
+                )
+            token_ids = checked_tokens(output.token_ids)
+            if token_ids or not config.require_nonempty:
+                candidates = None
+                if config.sampling_config.get("delta_top_logprobs") is not None:
+                    candidates = (output.extra_fields or {}).get("delta_top_logprobs")
+                    if candidates is None or len(candidates) != len(token_ids) or any(not row for row in candidates):
+                        raise ValueError("MC continuation is missing token-aligned delta_top_logprobs")
+                return MCContinuation(
+                    token_ids,
+                    tokenizer.decode(token_ids, skip_special_tokens=config.continuation_skip_special_tokens),
+                    delta_top_logprobs=candidates,
+                )
+        raise ValueError("MC continuation stayed empty after four attempts")
 
     tasks = [asyncio.create_task(generate_one(i)) for i in range(config.continuations_per_state)]
     try:
