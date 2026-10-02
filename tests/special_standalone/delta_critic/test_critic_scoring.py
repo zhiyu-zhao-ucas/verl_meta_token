@@ -306,3 +306,44 @@ def test_transfer_queue_round_trip_preserves_row_keys_and_unpadded_lengths(tiny_
     finally:
         if started:
             tq.close()
+
+
+def test_legacy_missing_label_requires_declared_source_and_preserves_original(tiny_model, tmp_path):
+    config = ScalarConfig(str(tiny_model), dtype="float32", max_length=8, target_normalization="none")
+    model = DeltaScalarModel.from_config(config)
+    original = _source_checkpoint(tiny_model, config, model)
+    original["training_method"].pop("delta_label_mode")
+    checkpoint = tmp_path / "legacy.pt"
+    torch.save(original, checkpoint)
+    with pytest.raises(ValueError, match="missing delta label"):
+        import_legacy(checkpoint, tmp_path / "missing")
+    with pytest.raises(ValueError, match="label_mode_source"):
+        import_legacy(checkpoint, tmp_path / "unsourced", declared_label_mode="selected_segment")
+    meta = import_legacy(
+        checkpoint,
+        tmp_path / "declared",
+        declared_label_mode="selected_segment",
+        label_mode_source="run/configs/selected_segment.yaml",
+    )
+    assert meta["config"]["delta_label_mode"] == "selected_segment"
+    assert "delta_label_mode" not in meta["source_metadata"]["training_method"]
+    assert meta["source_sha256"] == file_hash(checkpoint)
+    assert meta["declared_metadata"] == {
+        "delta_label_mode": "selected_segment",
+        "source": "run/configs/selected_segment.yaml",
+    }
+    assert meta["inferred_metadata"] == {}
+
+
+def test_legacy_label_declaration_cannot_override_recorded_mode(tiny_model, tmp_path):
+    config = ScalarConfig(str(tiny_model), dtype="float32", max_length=8, target_normalization="none")
+    model = DeltaScalarModel.from_config(config)
+    checkpoint = tmp_path / "legacy.pt"
+    torch.save(_source_checkpoint(tiny_model, config, model), checkpoint)
+    with pytest.raises(ValueError, match="conflicts"):
+        import_legacy(
+            checkpoint,
+            tmp_path / "bad",
+            declared_label_mode="paired_next_state",
+            label_mode_source="other-experiment.yaml",
+        )

@@ -80,23 +80,28 @@ def validate_terminal_stats(stats):
     return stats
 
 
-def tokenizer_fingerprint(path, trust_remote_code=False, *, expected_vocab_size=None):
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=trust_remote_code)
+def tokenizer_fingerprint_from_tokenizer(tokenizer, *, expected_vocab_size=None):
+    """Fingerprint an already loaded tokenizer using the scalar-artifact contract."""
     vocab = tokenizer.get_vocab()
     if not isinstance(vocab, dict) or not vocab:
-        raise ValueError(f"Tokenizer at {path!r} has no vocabulary")
+        raise ValueError("Tokenizer has no vocabulary")
     token_ids = list(vocab.values())
     if any(isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0 for token_id in token_ids):
-        raise ValueError(f"Tokenizer at {path!r} has invalid vocabulary IDs")
+        raise ValueError("Tokenizer has invalid vocabulary IDs")
     if len(set(token_ids)) != len(token_ids):
-        raise ValueError(f"Tokenizer at {path!r} maps multiple tokens to the same ID")
+        raise ValueError("Tokenizer maps multiple tokens to the same ID")
     if expected_vocab_size is not None and max(token_ids) >= expected_vocab_size:
         raise ValueError(
             f"Tokenizer vocabulary ID {max(token_ids)} exceeds backbone vocabulary size {expected_vocab_size}"
         )
-    return fingerprint({"vocab": vocab, "special_tokens": tokenizer.special_tokens_map}), tokenizer
+    return fingerprint({"vocab": vocab, "special_tokens": tokenizer.special_tokens_map})
+
+
+def tokenizer_fingerprint(path, trust_remote_code=False, *, expected_vocab_size=None):
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=trust_remote_code)
+    return tokenizer_fingerprint_from_tokenizer(tokenizer, expected_vocab_size=expected_vocab_size), tokenizer
 
 
 def load_weights(model, state):
@@ -191,7 +196,15 @@ def read_artifact(directory):
     return meta
 
 
-def import_legacy(path, output, *, expected_model=None, expected_tokenizer=None):
+def import_legacy(
+    path,
+    output,
+    *,
+    expected_model=None,
+    expected_tokenizer=None,
+    declared_label_mode=None,
+    label_mode_source=None,
+):
     from .scalar_model import DeltaScalarModel
 
     path = Path(path)
@@ -230,6 +243,19 @@ def import_legacy(path, output, *, expected_model=None, expected_tokenizer=None)
     if loss_mask not in {"response", "selected_state", "selected_delta"}:
         raise ValueError(f"Unsupported scalar supervision mask: {loss_mask!r}")
     delta_label_mode = method.get("delta_label_mode", (source_config.get("critic") or {}).get("delta_label_mode"))
+    declared_metadata = {}
+    if declared_label_mode is not None:
+        if declared_label_mode not in {"selected_segment", "paired_next_state"}:
+            raise ValueError(f"Unsupported declared delta label mode: {declared_label_mode!r}")
+        if not isinstance(label_mode_source, str) or not label_mode_source.strip():
+            raise ValueError("An explicit label mode requires a nonempty label_mode_source")
+        if delta_label_mode is not None and delta_label_mode != declared_label_mode:
+            raise ValueError("Declared delta label mode conflicts with checkpoint metadata")
+        if delta_label_mode is None:
+            declared_metadata = {"delta_label_mode": declared_label_mode, "source": label_mode_source}
+            delta_label_mode = declared_label_mode
+    elif label_mode_source is not None:
+        raise ValueError("label_mode_source requires declared_label_mode")
     if delta_label_mode not in {"selected_segment", "paired_next_state"}:
         raise ValueError(f"Unsupported or missing delta label mode: {delta_label_mode!r}")
     model_cfg = source_config.get("model")
@@ -321,9 +347,8 @@ def import_legacy(path, output, *, expected_model=None, expected_tokenizer=None)
         source_metadata={k: v for k, v in old.items() if k != "model"},
         resume_capable=False,
         semantics_changes=[],
-        inferred_metadata={"delta_label_mode": delta_label_mode}
-        if "delta_label_mode" not in method and not (source_config.get("critic") or {}).get("delta_label_mode")
-        else {},
+        declared_metadata=declared_metadata,
+        inferred_metadata={},
     )
 
 
@@ -333,9 +358,16 @@ def main():
     parser.add_argument("output")
     parser.add_argument("--expected-model")
     parser.add_argument("--expected-tokenizer")
+    parser.add_argument("--declared-label-mode", choices=["selected_segment", "paired_next_state"])
+    parser.add_argument("--label-mode-source", help="Run config or experiment record establishing a missing label mode")
     args = parser.parse_args()
     import_legacy(
-        args.checkpoint, args.output, expected_model=args.expected_model, expected_tokenizer=args.expected_tokenizer
+        args.checkpoint,
+        args.output,
+        expected_model=args.expected_model,
+        expected_tokenizer=args.expected_tokenizer,
+        declared_label_mode=args.declared_label_mode,
+        label_mode_source=args.label_mode_source,
     )
 
 
