@@ -62,13 +62,26 @@ def critic_targets(example: DeltaExample, config: DeltaConfig) -> tuple[TokenVec
 
 
 def state_advantages(
-    example: DeltaExample, config: DeltaConfig, *, raw_predictions: Mapping[int, float] | None = None
+    example: DeltaExample,
+    config: DeltaConfig,
+    *,
+    raw_predictions: Mapping[int, float] | None = None,
+    reward_delta: float | None = None,
 ) -> TokenVector:
     """Predictions are already denormalized scalars keyed by response token index.
 
     Require every selected prediction; never silently substitute an MC label for
     a missing model output. Original labels remain available in the example.
+
+    ``reward_delta`` overrides the critic for one whole response: every response
+    token carries that scalar and is marked as a state token. Callers use it for
+    responses too short for a local prefix-to-prefix delta to carry signal, where
+    the realized outcome reward is already known. The value stays in reward units,
+    so downstream normalization treats it like any other raw delta.
     """
+    length = len(example.rollout.response_token_ids)
+    if reward_delta is not None:
+        return TokenVector((finite(reward_delta, "reward_delta"),) * length, (1.0,) * length)
     if config.advantage_source == "critic":
         indices = {state.token_index for state in example.states}
         if raw_predictions is None or set(raw_predictions) != indices:
@@ -78,7 +91,6 @@ def state_advantages(
         if raw_predictions is not None:
             raise ValueError("mc_label advantage source does not consume critic predictions")
         values = selected_labels(example, config.label_mode)
-    length = len(example.rollout.response_token_ids)
     advantages, mask = [0.0] * length, [0.0] * length
     for index, (state, value) in enumerate(zip(example.states, values, strict=True)):
         end = state.token_index + 1
@@ -126,6 +138,22 @@ def normalize(
         for value, keep in zip(vector.values, vector.mask, strict=True)
     )
     return TokenVector(values, vector.mask)
+
+
+def clip_advantages(vector: TokenVector, limit: float) -> tuple[TokenVector, int]:
+    """Bound a normalized advantage vector to ``[-limit, limit]``.
+
+    Returns the bounded vector and how many active entries were clamped. Inactive
+    entries stay at zero, so a clipped row keeps its mask and its row weight.
+    """
+    if not math.isfinite(limit) or limit <= 0.0:
+        raise ValueError("advantage clip limit must be positive and finite")
+    values, clamped = [], 0
+    for value, keep in zip(vector.values, vector.mask, strict=True):
+        if keep and (value > limit or value < -limit):
+            value, clamped = max(-limit, min(limit, value)), clamped + 1
+        values.append(value)
+    return TokenVector(tuple(values), vector.mask), clamped
 
 
 def denormalize_predictions(

@@ -34,7 +34,13 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
+from verl.utils.device import (
+    get_device_id,
+    get_device_name,
+    get_nccl_backend,
+    get_torch_device,
+    set_expandable_segments,
+)
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -57,6 +63,45 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _global_valid_sample_weight(data: TensorDict, engine) -> float:
+    """Sum real row weights across DP ranks for one logical PPO minibatch."""
+    row_weight = tu.get(data, "row_weight", None)
+    sample_valid = tu.get(data, "sample_valid_mask", None)
+    if not isinstance(row_weight, torch.Tensor) or not isinstance(sample_valid, torch.Tensor):
+        raise ValueError("Delta policy updates require tensor row_weight and sample_valid_mask fields")
+    if row_weight.ndim != 1 or sample_valid.shape != row_weight.shape:
+        raise ValueError("Delta row_weight and sample_valid_mask must be matching [batch] tensors")
+    row_weight = row_weight.to(dtype=torch.float64)
+    sample_valid = sample_valid.to(device=row_weight.device, dtype=torch.float64)
+    if (
+        not torch.isfinite(row_weight).all()
+        or (row_weight < 0).any()
+        or not torch.isfinite(sample_valid).all()
+        or ((sample_valid != 0) & (sample_valid != 1)).any()
+    ):
+        raise ValueError("Delta row weights must be finite/nonnegative and sample validity must be binary")
+    local_weight = (row_weight * sample_valid).sum()
+    dp_size = int(engine.get_data_parallel_size())
+    if dp_size < 1:
+        raise ValueError("Engine data parallel size must be positive")
+    if dp_size > 1:
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("Distributed process group is required for delta row-weight reduction")
+        # Accelerator collectives require accelerator tensors; Gloo supports CPU.
+        backend = torch.distributed.get_backend(engine.get_data_parallel_group())
+        if backend == get_nccl_backend():
+            local_weight = local_weight.to(device=f"{get_device_name()}:{get_device_id()}")
+        torch.distributed.all_reduce(
+            local_weight,
+            op=torch.distributed.ReduceOp.SUM,
+            group=engine.get_data_parallel_group(),
+        )
+    result = float(local_weight.item())
+    if not torch.isfinite(torch.tensor(result)):
+        raise ValueError("Global delta row weight must be finite")
+    return result
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -288,6 +333,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 maybe_fix_3d_position_ids(mini_batch_td)
+                if "delta_policy_config" in mini_batch_td.keys():
+                    denominator = _global_valid_sample_weight(mini_batch_td, self.engine)
+                    tu.assign_non_tensor(mini_batch_td, global_valid_sample_weight=denominator)
                 # add global token num
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)

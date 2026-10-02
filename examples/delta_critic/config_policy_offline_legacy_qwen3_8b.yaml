@@ -1,0 +1,28 @@
+# Historical value_model state-only reproduction settings. This explicitly
+# selects that run family's 2048-token tail window; change max_length/window
+# for a new full-context offline experiment.
+model_path: Qwen/Qwen3-8B
+mode: offline_legacy
+advantage_source: critic
+label_mode: selected_segment
+advantage_normalization: standardize
+behavior_logprob_source: stored
+clip_range: 0.2
+kl_coef: 0.01
+kl_reference: behavior
+kl_mask_scope: policy
+kl_estimator: source_sampled_reverse
+train_logprob_temperature: 1.0
+max_length: 2048
+window: legacy_tail
+
+dtype: bfloat16
+attention_implementation: sdpa
+trust_remote_code: false
+gradient_checkpointing: true
+learning_rate: 1.0e-5
+weight_decay: 0.0
+gradient_clip: 1.0
+rl_epochs: 40
+save_every_steps: 100
+seed: 42

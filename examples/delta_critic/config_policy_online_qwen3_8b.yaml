@@ -1,0 +1,28 @@
+# Current online delta-PPO path. The reference stays at the initial actor while
+# model_path is replaced by each preceding round's final_hf export.
+model_path: Qwen/Qwen3-8B
+reference_model_path: Qwen/Qwen3-8B
+mode: online_ppo
+advantage_source: critic
+label_mode: selected_segment
+advantage_normalization: standardize
+behavior_logprob_source: actor_snapshot
+clip_range: 0.2
+kl_coef: 0.001
+kl_reference: reference
+kl_mask_scope: policy
+kl_estimator: low_var_kl
+train_logprob_temperature: 1.0
+max_length: null
+window: error
+
+dtype: bfloat16
+attention_implementation: sdpa
+trust_remote_code: false
+gradient_checkpointing: true
+learning_rate: 1.0e-5
+weight_decay: 0.0
+gradient_clip: 1.0
+rl_epochs: 1
+save_every_steps: 100
+seed: 42

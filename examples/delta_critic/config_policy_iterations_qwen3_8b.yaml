@@ -1,0 +1,23 @@
+# Run from the repository root. Choose available devices using CUDA_VISIBLE_DEVICES.
+# Stages are sequential: the collector exits before critic or actor training.
+sampling_config: examples/delta_critic/config_sampling_qwen3_8b.yaml
+critic_config: examples/delta_critic/config_train_qwen3_8b.yaml
+policy_config: examples/delta_critic/config_policy_online_qwen3_8b.yaml
+algorithm: ours_segment_legacy
+rounds: 2
+# Reference defaults to initial_actor and NEVER changes between rounds.
+initial_actor: Qwen/Qwen3-8B
+reference_model: Qwen/Qwen3-8B
+initial_critic: null
+nproc: 1
+critic_global_batch: 8
+critic_steps: 100
+policy_global_batch: 128
+microbatch: 1
+# policy_steps omitted: use the online policy config's rl_epochs (default one).
+eval_fraction: 0.1
+seed: 42
+prompt_source: value_model
+rollout_concurrency: 8
+mc_concurrency: 16
+gpu_memory_utilization: 0.9

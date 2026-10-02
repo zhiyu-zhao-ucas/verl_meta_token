@@ -27,6 +27,7 @@ from examples.delta_critic.batch_adapter import pad_response_rows, read_position
 from examples.delta_critic.contracts import DeltaExample, TokenVector
 from examples.delta_critic.legacy_adapter import adapt_legacy_rows, terminal_after_last_token
 from examples.delta_critic.target_ops import (
+    clip_advantages,
     critic_targets,
     denormalize_predictions,
     fit_normalization,
@@ -92,6 +93,33 @@ def test_golden_local_and_segment(example, config):
     oracle = state_advantages(example, oracle_config)
     assert oracle.values == pytest.approx([0, 0.1, 0, 0, -0.3, 0])
     assert oracle.mask == targets.mask
+
+
+def test_reward_delta_replaces_the_critic_over_the_whole_response(example, config):
+    """A short response carries its realized reward on every token."""
+    reward = state_advantages(example, config, raw_predictions={1: 0.1, 4: -0.3}, reward_delta=1.0)
+    assert reward.values == pytest.approx([1.0] * 6)
+    assert reward.mask == (1.0,) * 6
+    # The competing critic predictions are ignored, not merged.
+    zero = state_advantages(example, config, raw_predictions={1: 0.1, 4: -0.3}, reward_delta=0.0)
+    assert zero.values == pytest.approx([0.0] * 6)
+    assert zero.mask == (1.0,) * 6
+    with pytest.raises(ValueError, match="reward_delta"):
+        state_advantages(example, config, reward_delta=float("nan"))
+
+
+def test_clip_advantages_bounds_active_entries_and_counts_them():
+    vector = TokenVector((3.0, -4.0, 0.5, 0.0), (1.0, 1.0, 1.0, 0.0))
+    clipped, count = clip_advantages(vector, 2.0)
+    assert clipped.values == pytest.approx([2.0, -2.0, 0.5, 0.0])
+    assert clipped.mask == vector.mask
+    assert count == 2
+    untouched, none_clamped = clip_advantages(vector, 10.0)
+    assert untouched == vector
+    assert none_clamped == 0
+    for limit in (0.0, -1.0, float("inf")):
+        with pytest.raises(ValueError, match="positive and finite"):
+            clip_advantages(vector, limit)
 
 
 def test_zero_delta_remains_supervised(example, config):
