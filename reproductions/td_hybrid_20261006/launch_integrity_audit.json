@@ -1,0 +1,51 @@
+{
+  "checked_at_utc": "2026-10-07T02:25:05.819011+00:00",
+  "run": "/scratch2/zhiyu/code/new_verl/verl_meta_token/outputs/delta_historical_bugfix_retry_20261006_02",
+  "sources": {
+    "td": {
+      "files_checked": 1304,
+      "actual_runtime_python_files_checked": 727,
+      "mismatches": [],
+      "config_matches_launch": true,
+      "reward_matches_launch": true,
+      "revision_matches_launch": true
+    },
+    "hybrid": {
+      "files_checked": 1308,
+      "actual_runtime_python_files_checked": 730,
+      "mismatches": [],
+      "config_matches_launch": true,
+      "reward_matches_launch": true,
+      "revision_matches_launch": true
+    }
+  },
+  "runtime_assets": {
+    "driver.py": {
+      "sha256": "f5611bf2091a33ac881bebae2ea70bcf8a31cf30311cdbce59b259acd5da28d0",
+      "matches_launch": true
+    },
+    "runner.py": {
+      "sha256": "d0e95ba1c0f3411dbd4ad6095e04f32df858b2a4e696d16be7df412b71ead570",
+      "matches_launch": true
+    },
+    "prompt_audit.py": {
+      "sha256": "44b9093a9274bdb2852b023df8f9418f671c58110645456e1e8b5e611ae34c0b",
+      "matches_launch": true
+    },
+    "prepare_runs.py": {
+      "sha256": "768a719404104f8e05e82717cfb50b3044444c7cd459b08da2c877fb1d6c34f8",
+      "matches_launch": true
+    },
+    "environment.json": {
+      "sha256": "3aba4efb490c4d18fb8ee560ee72bc4457bdede26e32bdbe04c543c375047848",
+      "matches_launch": true
+    },
+    "evaluation_tools/assets_revision.json": {
+      "sha256": "2d5b6ceff1fd40a3c46b67636e869d85e93d8007d1ea5579ef09c45726d91bb2",
+      "matches_launch": true
+    }
+  },
+  "orchestration_note": "Original sealed files unchanged. Parallel training and later early/parallel checkpoint evaluation scripts were added after TD launch; preserved separately.",
+  "external_environment_limit": "Recorded interpreter and distribution versions retained; no launch-time byte hashes for all third-party libraries existed.",
+  "parallel_scheduler_matches_own_launch": true
+}

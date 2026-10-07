@@ -1,0 +1,39 @@
+{
+  "checked_at_utc": "2026-10-07T02:34:40.937643+00:00",
+  "cpu_regression": {
+    "command": "uv run --offline --no-project --python <recorded Python> python -m pytest -q tests/special_standalone/delta_critic/test_frozen_reproduction.py",
+    "passed": 7
+  },
+  "restored_driver_hooks": {
+    "prompt_hash_callable_despite_source_digest_string": true,
+    "actual_submit_hook_passed": true,
+    "actual_update_hook_dp": [
+      4,
+      2
+    ],
+    "batch_order_and_advantages_preserved": true,
+    "diagnostic_serialization_passed": true,
+    "actual_tensordict_linkedlist_serialized": true,
+    "diagnostic_write_failure_does_not_block_actor": true,
+    "real_actor_failure_still_propagates": true
+  },
+  "external_weights_preflight": {
+    "command": "run.py check --work-dir /tmp/tdhyb-frozen-restore-test --weights",
+    "passed": true,
+    "scope": "Base3 shards, TD80/Hybrid80 model.pt and metadata, tokenizer files, archive/data and all restored source hashes"
+  },
+  "actual_checkpoint_resume_preparation": {
+    "td": {
+      "checkpoint_step": 10,
+      "stop_step": 20,
+      "passed": true
+    },
+    "hybrid": {
+      "checkpoint_step": 10,
+      "stop_step": 20,
+      "passed": true
+    }
+  },
+  "gpu_continuation_launched": false,
+  "archive_sha256": "0fa7339401b3f44b69b56cefe52d4de00febe5f6a2aecd93a2f11c9fd5f1b60d"
+}
