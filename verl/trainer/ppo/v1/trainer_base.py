@@ -493,8 +493,14 @@ class PPOTrainer(ABC):
                 self._stop_profiling()
 
                 # 2. save checkpoint
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                save_steps = self.config.trainer.get("save_steps", [])
+                if (
+                    (
+                        self.config.trainer.save_freq > 0
+                        and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0)
+                    )
+                    or self.global_steps in save_steps
+                    or (save_steps and is_last_step)
                 ):
                     with marked_timer("save_checkpoint", self.timing_raw, color="green"):
                         self._save_checkpoint()
@@ -941,11 +947,9 @@ class PPOTrainer(ABC):
                 del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
 
-        if (
-            self.delta_policy_settings
-            and self.delta_policy_settings.get("rollout_mode") == "selected_prefix_mc"
-            and not self.delta_policy_settings.get("expansion", {}).get("enabled", False)
-        ):
+        from examples.delta_critic.policy_online import online_critic_updates_enabled
+
+        if self.delta_policy_settings and online_critic_updates_enabled(self.delta_policy_settings):
             self._delta_policy_scorer.load_online(
                 os.path.join(global_step_folder, "delta_critic.pt"), self.global_steps
             )
@@ -1068,11 +1072,9 @@ class PPOTrainer(ABC):
                 metadata={"global_steps": self.global_steps},
             )
 
-        if (
-            self.delta_policy_settings
-            and self.delta_policy_settings.get("rollout_mode") == "selected_prefix_mc"
-            and not self.delta_policy_settings.get("expansion", {}).get("enabled", False)
-        ):
+        from examples.delta_critic.policy_online import online_critic_updates_enabled
+
+        if self.delta_policy_settings and online_critic_updates_enabled(self.delta_policy_settings):
             self._delta_policy_scorer.save_online(
                 os.path.join(local_global_step_folder, "delta_critic.pt"), self.global_steps
             )
@@ -1609,11 +1611,16 @@ class PPOTrainer(ABC):
             prompt_count = expansion["prompts_per_step"]
             state_count = expansion["states_per_step"]
             batch = self._next_train_batch(prompt_count)
-            # Rotate assignments so the same dataloader positions are not
-            # always selected for the extra generation budget.
-            start = (self.global_steps - 1) * state_count % prompt_count
-            selected = {(start + offset) % prompt_count for offset in range(state_count)}
-            batch["delta_expand"] = torch.tensor([i in selected for i in range(prompt_count)], dtype=torch.bool)
+            if expansion.get("protocol", {}).get("enabled", False):
+                from examples.delta_critic.online_protocol import annotate_protocol_batch
+
+                annotate_protocol_batch(batch, expansion, self.global_steps)
+            else:
+                # Rotate assignments so the same dataloader positions are not
+                # always selected for the extra generation budget.
+                start = (self.global_steps - 1) * state_count % prompt_count
+                selected = {(start + offset) % prompt_count for offset in range(state_count)}
+                batch["delta_expand"] = torch.tensor([i in selected for i in range(prompt_count)], dtype=torch.bool)
             self._submit_batch_to_rollout(batch)
         else:
             self._add_batch_to_generate()
@@ -1789,6 +1796,34 @@ class PPOTrainer(ABC):
                 raise ValueError(f"Short-response delta reward must be finite for row {key}")
             if length <= short_response_budget:
                 selected[key] = value
+        return selected
+
+    @staticmethod
+    def _short_response_reward_baselines(
+        batch: KVBatchMeta,
+        data,
+        *,
+        short_response_budget: int | None,
+        fallback_baseline: float,
+    ) -> dict[str, float]:
+        """Return the action-independent baseline stored for each short outcome."""
+        if short_response_budget is None:
+            return {}
+        lengths = PPOTrainer._tq_field_rows(data["delta_reward_text_length"])
+        if "delta_reward_baseline" in data:
+            baselines = PPOTrainer._tq_field_rows(data["delta_reward_baseline"])
+        else:
+            baselines = [fallback_baseline] * len(batch)
+        if len(lengths) != len(batch) or len(baselines) != len(batch):
+            raise ValueError("Short-response baseline fields do not match the sampled batch")
+        selected = {}
+        for key, tag, length, baseline in zip(batch.keys, batch.tags, lengths, baselines, strict=True):
+            if tag.get("is_padding", False) or length > short_response_budget:
+                continue
+            value = float(baseline)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"Short-response reward baseline must be finite and in [0, 1] for row {key}")
+            selected[key] = value
         return selected
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
@@ -2036,7 +2071,7 @@ class PPOTrainer(ABC):
         if expansion.get("enabled", False):
             fields.append("delta_is_continuation")
             if short_response_budget is not None:
-                fields.extend(["delta_true_reward", "delta_reward_text_length"])
+                fields.extend(["delta_true_reward", "delta_reward_text_length", "delta_reward_baseline"])
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
         continuation_flags = (
             [bool(v) for v in self._tq_field_rows(data["delta_is_continuation"])]
@@ -2046,6 +2081,16 @@ class PPOTrainer(ABC):
         reward_deltas_by_id = self._short_response_reward_deltas(
             batch, data, short_response_budget=short_response_budget
         )
+        outcome_baselines_by_id = self._short_response_reward_baselines(
+            batch,
+            data,
+            short_response_budget=short_response_budget,
+            fallback_baseline=self.delta_policy_config.short_outcome_baseline,
+        )
+        outcome_advantages_by_id = {
+            rollout_id: (reward - outcome_baselines_by_id[rollout_id]) / self.delta_policy_config.short_outcome_scale
+            for rollout_id, reward in reward_deltas_by_id.items()
+        }
         prompts = self._tq_field_rows(data["prompts"])
         responses = self._tq_field_rows(data["responses"])
         response_masks = self._tq_field_rows(data["response_mask"])
@@ -2131,11 +2176,14 @@ class PPOTrainer(ABC):
         from examples.delta_critic.policy_data import prepare_policy_rows
 
         fixed_stats = self.delta_policy_settings.get("advantage_stats_mode", "per_rollout") == "initial_rollout"
+        stats_population = self.delta_policy_settings.get("advantage_stats_fit_population", "all")
         stats = getattr(self, "_delta_policy_stats", None) if fixed_stats else None
         if fixed_stats:
             from examples.delta_critic.policy_online import initial_advantage_stats
 
-            stats_path = os.path.join(self.config.trainer.default_local_dir, "delta_advantage_stats.json")
+            local_stats_path = os.path.join(self.config.trainer.default_local_dir, "delta_advantage_stats.json")
+            stats_path = self.delta_policy_settings.get("advantage_stats_path") or local_stats_path
+            stats_file_exists = os.path.exists(stats_path)
             stats_identity = {
                 "reference_policy_id": self.delta_policy_settings["reference_policy_id"],
                 "critic_weights_sha256": self._delta_policy_scorer.metadata["weights_sha256"],
@@ -2146,9 +2194,16 @@ class PPOTrainer(ABC):
                 contract = "delta_originals_and_continuations_v1"
                 if not continuation_actor_loss:
                     contract = "delta_originals_only_v1"
+            if stats_population == "originals":
+                contract = "shared_initial_originals_only_v1"
             modifiers = []
             if short_response_budget is not None:
-                modifiers.append(f"short_reward_le{short_response_budget}")
+                modifiers.append(
+                    f"short_outcome_advantage_v2_le{short_response_budget}_"
+                    f"baseline{self.delta_policy_config.short_outcome_baseline:.17g}_"
+                    f"scale{self.delta_policy_config.short_outcome_scale:.17g}_"
+                    "loo_siblings_or_fixed"
+                )
             if self.delta_policy_config.advantage_clip is not None:
                 modifiers.append(f"advantage_clip_{self.delta_policy_config.advantage_clip}")
             if modifiers:
@@ -2156,8 +2211,31 @@ class PPOTrainer(ABC):
             if contract is not None:
                 stats_identity["advantage_contract"] = contract
             stats = initial_advantage_stats(stats_path, **stats_identity, stats=stats)
-            if stats is None and self.global_steps != 1:
+            if stats is None and self.delta_policy_settings.get("advantage_stats_read_only", False):
+                raise ValueError("Shared original calibration is missing; start its writer before dependent runs")
+            if stats is None and self.global_steps != 1 and not stats_file_exists:
                 raise ValueError("Missing initial advantage statistics: refusing to recalibrate a resumed policy")
+
+        if stats is None and stats_population == "originals":
+            original_ids = {
+                key for key, index in zip(row_ids, real_positions, strict=True) if not continuation_flags[index]
+            }
+            original_examples = [example for example in examples if example.rollout.rollout_id in original_ids]
+            _, stats = prepare_policy_rows(
+                original_examples,
+                raw_predictions_by_id,
+                behavior_by_id,
+                self.delta_policy_config,
+                reference_logprobs_by_id=reference_by_id,
+                reference_policy_id=self.delta_policy_settings["reference_policy_id"],
+                row_weights_by_id=row_weights,
+                fit_stats=True,
+                outcome_advantages_by_id={
+                    key: value for key, value in outcome_advantages_by_id.items() if key in original_ids
+                },
+            )
+            if stats is None:
+                raise ValueError("Shared initial original batch has no non-short critic calibration population")
 
         prepared_rows, stats = prepare_policy_rows(
             examples,
@@ -2169,10 +2247,12 @@ class PPOTrainer(ABC):
             row_weights_by_id=row_weights,
             stats=stats,
             fit_stats=self.delta_policy_config.advantage_normalization == "standardize" and stats is None,
-            reward_deltas_by_id=reward_deltas_by_id,
+            outcome_advantages_by_id=outcome_advantages_by_id,
         )
         if fixed_stats:
-            initial_advantage_stats(stats_path, **stats_identity, stats=stats)
+            initial_advantage_stats(stats_path, **stats_identity, stats=stats, persist_pending=True)
+            if os.fspath(stats_path) != local_stats_path:
+                initial_advantage_stats(local_stats_path, **stats_identity, stats=stats, persist_pending=True)
         if self.delta_policy_config.advantage_clip is not None:
             metrics["delta_policy/advantage_clip"] = float(self.delta_policy_config.advantage_clip)
             metrics["delta_policy/clipped_advantage_tokens"] = sum(
@@ -2214,7 +2294,8 @@ class PPOTrainer(ABC):
                 output_advantages.append(row["advantages"])
                 output_state_masks.append(row["state_mask"])
                 output_policy_masks.append(mask)
-                output_kl_masks.append(mask)
+                kl_mask = response_masks[index] if self.delta_policy_config.kl_mask_scope == "response" else mask
+                output_kl_masks.append(kl_mask if row_weights[key] else [0.0] * response_length)
                 output_critic_masks.append(prediction["critic_signal_mask"])
                 output_critic_predictions.append(prediction["delta_pred_raw"])
                 output_selected_indices.append(selected_indices[index])
@@ -2225,6 +2306,80 @@ class PPOTrainer(ABC):
             output_values.append([0.0] * response_length)
             output_returns.append([0.0] * response_length)
             output_rewards.append([float(value) for value in reward_scores[index]])
+
+        # These are pre-update, sampled fixed-reference diagnostics. Measure the
+        # entire response as well as PG-covered tokens, even when optimization
+        # deliberately regularizes only the policy mask.
+        reference_kl = {"response": [], "policy": [], "outside_policy": []}
+        reward_advantages = {"zero": [], "positive": []}
+        realized_rewards = (
+            self._tq_field_rows(data["delta_true_reward"])
+            if "delta_true_reward" in data
+            else [sum(row) for row in reward_scores]
+        )
+        policy_tokens = response_tokens = 0
+        for index in real_positions:
+            if not row_weights[batch.keys[index]]:
+                continue
+            response_mask = np.asarray(response_masks[index], dtype=bool)
+            policy_mask = np.asarray(output_policy_masks[index], dtype=bool)
+            policy_tokens += int(policy_mask.sum())
+            response_tokens += int(response_mask.sum())
+            log_ratio = np.clip(
+                np.asarray(reference_logprobs[index], dtype=np.float64)
+                - np.asarray(behavior_logprobs[index], dtype=np.float64),
+                -20.0,
+                20.0,
+            )
+            sampled_kl = np.exp(log_ratio) - log_ratio - 1.0
+            if self.delta_policy_config.kl_estimator == "low_var_kl":
+                sampled_kl = np.clip(sampled_kl, -10.0, 10.0)
+            for name, diagnostic_mask in (
+                ("response", response_mask),
+                ("policy", policy_mask),
+                ("outside_policy", response_mask & ~policy_mask),
+            ):
+                if diagnostic_mask.any():
+                    reference_kl[name].append(float(sampled_kl[diagnostic_mask].mean()))
+            if policy_mask.any():
+                reward = realized_rewards[index]
+                group = "positive" if reward > 0.0 else "zero" if reward == 0.0 else None
+                if group is not None:
+                    advantage = np.asarray(output_advantages[index], dtype=np.float64)
+                    reward_advantages[group].append(float(advantage[policy_mask].mean()))
+        metrics["delta_policy/policy_token_coverage"] = policy_tokens / max(response_tokens, 1)
+        for scope, values in reference_kl.items():
+            metrics[f"delta_policy/preupdate_ref_kl_{scope}_row_mean"] = float(np.mean(values)) if values else 0.0
+            metrics[f"delta_policy/preupdate_ref_kl_{scope}_rows"] = len(values)
+        for reward_group, values in reward_advantages.items():
+            prefix = f"delta_policy/{reward_group}_reward"
+            metrics[f"{prefix}_rows"] = len(values)
+            metrics[f"{prefix}_row_advantage_mean"] = float(np.mean(values)) if values else 0.0
+            metrics[f"{prefix}_positive_row_advantage_fraction"] = (
+                sum(value > 0.0 for value in values) / len(values) if values else 0.0
+            )
+
+        from examples.delta_critic.policy_diagnostics import policy_batch_diagnostics
+
+        metrics.update(
+            policy_batch_diagnostics(
+                [
+                    {
+                        "response_mask": response_masks[index],
+                        "policy_loss_mask": output_policy_masks[index],
+                        "advantages": output_advantages[index],
+                        "state_mask": output_state_masks[index],
+                        "raw_selected_deltas": list(raw_predictions_by_id[batch.keys[index]].values()),
+                        "is_continuation": continuation_flags[index],
+                        "is_outcome": batch.keys[index] in outcome_advantages_by_id,
+                        "actor_enabled": bool(row_weights[batch.keys[index]]),
+                        "reward": realized_rewards[index],
+                        "advantage_clip_count": prepared_by_id[batch.keys[index]]["advantage_clip_count"],
+                    }
+                    for index in real_positions
+                ]
+            )
+        )
 
         def nested_rows(rows, dtype):
             return torch.nested.as_nested_tensor([torch.tensor(row, dtype=dtype) for row in rows], layout=torch.jagged)
@@ -2293,6 +2448,9 @@ class PPOTrainer(ABC):
                     or not set(state["token_index"] for state in record["states"]).issubset(selected_indices[index])
                 ):
                     raise ValueError("MC record does not match its sampled policy trajectory")
+            from examples.delta_critic.mc_diagnostics import mc_batch_diagnostics
+
+            metrics.update(mc_batch_diagnostics(real_records))
             export_mc_attempt(
                 real_records,
                 os.path.join(self.config.trainer.default_local_dir, "mc_data", f"step_{self.global_steps:08d}"),
@@ -2303,7 +2461,7 @@ class PPOTrainer(ABC):
                 metrics["delta_policy/continuation_actor_loss_enabled"] = float(continuation_actor_loss)
                 metrics["delta_policy/actor_loss_continuation_rows"] = continuations if continuation_actor_loss else 0
                 metrics["delta_policy/continuation_advantage_from_critic"] = 1.0
-                metrics["delta_critic/update_step"] = 0
+                metrics["delta_critic/update_step"] = getattr(self._delta_policy_scorer, "update_step", 0)
                 if short_response_budget is not None:
                     substituted = [reward_deltas_by_id[key] for key in row_ids if key in reward_deltas_by_id]
                     metrics["delta_policy/short_response_tokens"] = short_response_budget
@@ -2314,9 +2472,22 @@ class PPOTrainer(ABC):
                     metrics["delta_policy/short_response_mean_reward"] = (
                         sum(substituted) / len(substituted) if substituted else 0.0
                     )
-            else:
+                    baselines = [outcome_baselines_by_id[key] for key in row_ids if key in outcome_baselines_by_id]
+                    calibrated = [outcome_advantages_by_id[key] for key in row_ids if key in outcome_advantages_by_id]
+                    metrics["delta_policy/short_response_mean_baseline"] = (
+                        sum(baselines) / len(baselines) if baselines else 0.0
+                    )
+                    metrics["delta_policy/short_response_mean_advantage"] = (
+                        sum(calibrated) / len(calibrated) if calibrated else 0.0
+                    )
+            from examples.delta_critic.policy_online import online_critic_updates_enabled
+
+            if online_critic_updates_enabled(self.delta_policy_settings):
                 metrics["delta_critic/prediction_update_step"] = self._delta_policy_scorer.update_step
-                metrics.update(self._delta_policy_scorer.fit_mc(real_records))
+                if self.delta_policy_settings.get("critic_update", {}).get("protocol") == "paired_fresh_v1":
+                    metrics.update(self._delta_policy_scorer.buffer_fit_mc(real_records, self.global_steps))
+                else:
+                    metrics.update(self._delta_policy_scorer.fit_mc(real_records))
         return batch
 
     def _update_critic(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:

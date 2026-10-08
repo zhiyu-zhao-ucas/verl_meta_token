@@ -17,7 +17,9 @@ import asyncio
 import json
 import multiprocessing
 import re
+import threading
 from concurrent.futures import ProcessPoolExecutor
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -188,7 +190,46 @@ def _parse_math(text: str, fallback: str, extraction: str):
     return tuple(parse(text, fallback_mode=fallback, extraction_mode=extraction))
 
 
+def _parse_math_answer(text: str, fallback: str, extraction: str):
+    """Parse a dataset answer as one expression, retaining textual fallback."""
+    delimited = any(marker in text for marker in ("$", r"\(", r"\[", r"\boxed{"))
+    is_math = re.search(r"[\\0-9=+*/^_(){}\[\],<>-]", text) or re.fullmatch(r"[A-Za-z]", text.strip())
+    if not delimited and is_math:
+        parsed = _parse_math("$" + text + "$", "no_fallback", extraction)
+        if parsed:
+            return parsed
+    return _parse_math(text, fallback, extraction)
+
+
+def _final_answer_field(response: str) -> tuple[int, str]:
+    """Extract the last anchored answer, including one following math block."""
+    pattern = (
+        r"(?im)^[ \t]*(?:\#{1,6}[ \t]+)?(?:\*{1,2})?"
+        r"(?:the[ \t]+)?(?:final[ \t]+)?answer(?:\*{1,2})?[ \t]*"
+        r"(?::|is\b[ \t]*:?)(?:\*{1,2})?[ \t]*([^\n]*)"
+    )
+    matches = list(re.finditer(pattern, response))
+    if not matches:
+        return -1, ""
+    match = matches[-1]
+    tail = match.group(1).strip()
+    if not tail:
+        tail = response[match.end() :].lstrip()
+        # A multiline field may contain one immediate math answer, never
+        # a later number harvested from explanatory prose.
+        math_start = re.match(r"(?:[-+.\d\\$({\[]|[A-Za-z](?:$|[ \t]*[=+*/^_()-]))", tail)
+        literal_text = re.fullmatch(r"[A-Za-z]+(?:[ \t]+[A-Za-z]+)*", tail.splitlines()[0]) if tail else None
+        if not math_start and not literal_text:
+            return match.start(), ""
+    for opening, closing in ((r"\[", r"\]"), (r"\(", r"\)"), ("$$", "$$"), ("$", "$")):
+        if tail.startswith(opening):
+            end = tail.find(closing, len(opening))
+            return match.start(), tail[: end + len(closing)] if end >= 0 else ""
+    return match.start(), tail.splitlines()[0].strip() if tail else ""
+
+
 def score_text(response: str, gold_answer: str | None, reward_config: dict) -> float:
+    """Score a response with the same math rule on main and worker threads."""
     method = reward_config.get("method", "math_verify")
     if method == "exact_or_numeric":
         if gold_answer is None or str(gold_answer).strip() == "":
@@ -201,6 +242,12 @@ def score_text(response: str, gold_answer: str | None, reward_config: dict) -> f
         raise ValueError(f"Unsupported reward method={method!r}")
     if gold_answer is None or not str(gold_answer).strip():
         return 0.0
+    if threading.current_thread() is not threading.main_thread():
+        # Reward managers call synchronous scorers in an executor thread.
+        # math-verify uses SIGALRM for both parsing and verification; in a
+        # thread it can swallow the signal error and mark correct answers 0.
+        # Reuse the MC scoring process so those timeouts stay enabled.
+        return _reward_executor().submit(score_text, response, gold_answer, dict(reward_config)).result()
     try:
         from math_verify import verify
     except ImportError as exc:
@@ -209,32 +256,64 @@ def score_text(response: str, gold_answer: str | None, reward_config: dict) -> f
         raise RuntimeError("reward.method=math_verify requires math-verify") from exc
     try:
         boxed = _boxed_answer(response)
+        final_answer = None
+        if reward_config.get("math_verify_require_final_answer", False):
+            boxed_position = response.rfind(r"\boxed{")
+            answer_position, answer_field = _final_answer_field(response)
+            if answer_position > boxed_position:
+                final_answer = answer_field
+                boxed = None  # Do not let an earlier box override this field.
+            else:
+                final_answer = boxed
+            if not final_answer:
+                return 0.0
         gold_text = str(gold_answer)
-        if boxed and reward_config.get("math_verify_simple_first", True):
-            left, right = re.sub(r"\s+", "", boxed.lower()), re.sub(r"\s+", "", gold_text.lower())
-            if left and left == right:
+        if reward_config.get("math_verify_simple_first", True):
+            # Leave normalization to math-verify rather than joining digits
+            # across whitespace or changing the case of literal text.
+            literal_answer = boxed or final_answer
+            if literal_answer and literal_answer.strip() == gold_text.strip():
                 return 1.0
-            left_number, right_number = _last_number(boxed), _last_number(right)
-            if left_number is not None and right_number is not None:
-                if abs(float(left_number) - float(right_number)) <= 1e-6:
+            # Only compare complete numeric literals here. Extracting the
+            # last number accepts unequal fractions with the same denominator
+            # (3/2 and 1/2), or an expression whose final operand is the gold.
+            number_pattern = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
+            if (
+                boxed
+                and re.fullmatch(number_pattern, boxed.strip())
+                and re.fullmatch(number_pattern, gold_text.strip())
+            ):
+                if abs(Decimal(boxed.strip()) - Decimal(gold_text.strip())) <= Decimal("1e-6"):
                     return 1.0
         max_boxed_chars = int(reward_config.get("math_verify_max_boxed_chars", 512))
         if boxed and max_boxed_chars > 0 and len(boxed) > max_boxed_chars:
             return 0.0
         extraction = str(reward_config.get("math_verify_extraction_mode", "first_match"))
-        prediction = _parse_math("$" + boxed + "$" if boxed else response, "no_fallback", extraction)
-        gold = _parse_math(gold_text, "first_match", extraction)
+        if final_answer is not None:
+            prediction = _parse_math_answer(final_answer, "no_fallback", extraction)
+        else:
+            prediction = _parse_math("$" + boxed + "$" if boxed else response, "no_fallback", extraction)
+        gold = _parse_math_answer(gold_text, "first_match", extraction)
         return float(bool(prediction and gold and verify(gold[0], prediction[0])))
     except Exception:
         return 0.0
 
 
-@lru_cache(maxsize=1)
+_reward_pool = None
+_reward_pool_lock = threading.Lock()
+
+
 def _reward_executor():
     # One reusable CPU worker per collector/AgentLoop process. Spawn avoids
     # inheriting CUDA/Ray state, and math-verify runs on its main thread so its
     # signal-based timeouts work. Python shuts the executor down on exit.
-    return ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+    global _reward_pool
+    # lru_cache can evaluate a first call more than once under concurrency.
+    # A lock keeps synchronous reward threads and async MC on one worker.
+    with _reward_pool_lock:
+        if _reward_pool is None:
+            _reward_pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+        return _reward_pool
 
 
 def _score_texts(responses, gold_answer, reward_config):

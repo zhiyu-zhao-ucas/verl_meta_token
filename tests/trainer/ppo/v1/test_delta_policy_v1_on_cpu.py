@@ -26,12 +26,31 @@ from transfer_queue import BatchMeta, KVBatchMeta
 
 from examples.delta_critic.checkpoint import tokenizer_fingerprint, tokenizer_fingerprint_from_tokenizer
 from examples.delta_critic.policy_config import DeltaPolicyConfig
+from examples.delta_critic.policy_online import validate_online_v1_settings
 from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer
 from verl.utils import transferqueue_utils as tq_utils
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.workers.engine_workers import TrainingWorker
 from verl.workers.utils.padding import response_from_nested
+
+
+@pytest.mark.parametrize("kl_mask_scope", ["policy", "response"])
+def test_online_v1_settings_preserve_requested_kl_scope(kl_mask_scope):
+    config = {
+        "algorithm": {
+            "delta_policy": {
+                "enabled": True,
+                "critic_artifact": "frozen-critic",
+                "reference_policy_id": "initial-actor",
+                "kl_mask_scope": kl_mask_scope,
+            }
+        },
+        "actor_rollout_ref": {"actor": {"strategy": "fsdp2", "use_kl_loss": True}, "rollout": {"name": "vllm"}},
+        "trainer": {"v1": {"trainer_mode": "sync"}},
+        "critic": {"enable": False},
+    }
+    assert validate_online_v1_settings(config).kl_mask_scope == kl_mask_scope
 
 
 @pytest.mark.parametrize("collect_mc,expansion", [(False, False), (True, False), (True, True)])
@@ -70,6 +89,7 @@ def test_delta_agent_loop_postprocess_writes_selected_fields_to_tq(monkeypatch, 
                 "algorithm": {
                     "delta_policy": {
                         "enabled": True,
+                        "short_outcome_baseline": 0.25,
                         "selection": {"states_per_response": 2, "min_token_gap": 1},
                     }
                 }
@@ -144,7 +164,7 @@ def test_delta_agent_loop_postprocess_writes_selected_fields_to_tq(monkeypatch, 
     if expansion:
         assert fields["prompts"][1].tolist() == [10, 11, 20]
         assert fields["responses"][1].tolist() == [30, 31, 32]
-        assert fields["rm_scores"][1].tolist() == [0.0, 0.0, 0.0]
+        assert fields["rm_scores"][1].tolist() == [0.0, 0.0, 1.0]
         assert fields["rm_scores"][2].tolist() == [0.0]
         assert fields["selected_token_indices"][1].tolist() == [1, 2]
         assert fields["selected_token_indices"][2].tolist() == [0]
@@ -157,11 +177,16 @@ def test_delta_agent_loop_postprocess_writes_selected_fields_to_tq(monkeypatch, 
         assert fields["delta_reward_text_length"][1].item() == 1 + 3
         assert fields["delta_true_reward"][2].item() == 0.0
         assert fields["delta_reward_text_length"][2].item() == 1 + 1
+        assert fields["delta_reward_baseline"].tolist() == pytest.approx([0.25, 0.0, 1.0])
+        assert [row.sum().item() for row in fields["rm_scores"].unbind()] == fields["delta_true_reward"].tolist()
 
 
 @pytest.mark.parametrize("stats_mode", ["per_rollout", "initial_rollout"])
 @pytest.mark.parametrize("collect_mc", [False, True])
-def test_delta_trainer_prepares_full_batch_and_zeros_padding(monkeypatch, tmp_path, stats_mode, collect_mc):
+@pytest.mark.parametrize("update_protocol", ["legacy", "paired_fresh_v1"])
+def test_delta_trainer_prepares_full_batch_and_zeros_padding(
+    monkeypatch, tmp_path, stats_mode, collect_mc, update_protocol
+):
     rows = [
         {
             "prompts": torch.tensor([10]),
@@ -213,6 +238,10 @@ def test_delta_trainer_prepares_full_batch_and_zeros_padding(monkeypatch, tmp_pa
         shift = 0.0
         update_step = 0
 
+        def buffer_fit_mc(self, records, policy_step):
+            assert policy_step == self.update_step + 1
+            return self.fit_mc(records)
+
         def fit_mc(self, records):
             assert len(written) == self.update_step + 1, "advantages must be written before fitting"
             assert len(records) == 2, "padding must not train the critic"
@@ -232,6 +261,7 @@ def test_delta_trainer_prepares_full_batch_and_zeros_padding(monkeypatch, tmp_pa
         _validate_delta_rollout_versions=lambda batch: None,
         _tq_field_rows=PPOTrainer._tq_field_rows,
         _short_response_reward_deltas=PPOTrainer._short_response_reward_deltas,
+        _short_response_reward_baselines=PPOTrainer._short_response_reward_baselines,
         global_steps=1,
         delta_policy_config=DeltaPolicyConfig.online(),
         delta_policy_settings={"reference_policy_id": "initial-actor", "advantage_stats_mode": stats_mode},
@@ -239,6 +269,8 @@ def test_delta_trainer_prepares_full_batch_and_zeros_padding(monkeypatch, tmp_pa
     )
     if collect_mc:
         trainer.delta_policy_settings["rollout_mode"] = "selected_prefix_mc"
+        if update_protocol == "paired_fresh_v1":
+            trainer.delta_policy_settings["critic_update"] = {"enabled": True, "protocol": update_protocol}
     monkeypatch.setattr("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get", lambda **kwargs: data)
     written = []
 
@@ -259,6 +291,12 @@ def test_delta_trainer_prepares_full_batch_and_zeros_padding(monkeypatch, tmp_pa
     assert batch.extra_info["delta_policy_config"]["behavior_logprob_source"] == "actor_snapshot"
     assert metrics["delta_policy/advantage_stats_mean"] == 2.0
     assert metrics["delta_policy/advantage_stats_std"] == 1.0
+    assert metrics["delta_policy/health/all/rows"] == 2
+    assert metrics["delta_policy/health/all/raw_delta_count"] == 2
+    assert metrics["delta_policy/health/all/raw_delta_mean"] == 2.0
+    assert metrics["delta_policy/health/all/advantage_count"] == 4
+    assert metrics["delta_policy/health/positive_reward/row_advantage_mean"] == -1.0
+    assert metrics["delta_policy/health/zero_reward/row_advantage_mean"] == 1.0
     assert fields["advantages"][0].tolist() == [-1.0, -1.0]
     if collect_mc:
         assert trainer._delta_policy_scorer.shift == 100.0
@@ -285,10 +323,99 @@ def test_delta_trainer_prepares_full_batch_and_zeros_padding(monkeypatch, tmp_pa
             PPOTrainer._compute_delta_policy_advantage(trainer, batch, metrics)
 
 
+def test_shared_original_calibration_preserves_continuation_actor_loss(monkeypatch, tmp_path):
+    keys = ["o0", "o1", "c0", "c1"]
+    values = [1.0, 3.0, 100.0, 200.0]
+    rows = [
+        {
+            "prompts": torch.tensor([10]),
+            "responses": torch.tensor([20, 21]),
+            "response_mask": torch.ones(2),
+            "policy_token_mask": torch.ones(2),
+            "selected_token_indices": torch.tensor([0]),
+            "delta_top_logprobs": [[{"prob": 0.6}], [{"prob": 0.8}]],
+            "old_log_probs": torch.full((2,), -1.0),
+            "ref_log_prob": torch.full((2,), -1.1),
+            "rm_scores": torch.zeros(2),
+            "delta_is_continuation": index >= 2,
+        }
+        for index in range(4)
+    ]
+    data = list_of_dict_to_tensordict(rows)
+    batch = KVBatchMeta(keys=keys, tags=[{} for _ in keys], partition_id="train")
+
+    class Scorer:
+        metadata = {"weights_sha256": "same-initial-critic"}
+
+        def score(self, examples):
+            return [
+                {"rollout_id": key, "delta_pred_raw": [value, 0.0], "critic_signal_mask": [1.0, 0.0]}
+                for key, value in zip(keys, values, strict=True)
+            ]
+
+    shared = tmp_path / "common" / "calibration.json"
+    trainer = SimpleNamespace(
+        _delta_policy_scorer=Scorer(),
+        _validate_delta_rollout_versions=lambda batch: None,
+        _tq_field_rows=PPOTrainer._tq_field_rows,
+        _short_response_reward_deltas=PPOTrainer._short_response_reward_deltas,
+        _short_response_reward_baselines=PPOTrainer._short_response_reward_baselines,
+        global_steps=1,
+        delta_policy_config=DeltaPolicyConfig.online(advantage_clip=5.0),
+        delta_policy_settings={
+            "reference_policy_id": "same-base",
+            "advantage_stats_mode": "initial_rollout",
+            "advantage_stats_fit_population": "originals",
+            "advantage_stats_path": str(shared),
+            "mc": {"continuations_per_state": 1},
+            "expansion": {"enabled": True, "prompts_per_step": 2, "states_per_step": 2},
+        },
+        config=SimpleNamespace(trainer=SimpleNamespace(default_local_dir=str(tmp_path / "writer"))),
+    )
+    written = []
+    monkeypatch.setattr("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get", lambda **kwargs: data)
+    monkeypatch.setattr(
+        "verl.trainer.ppo.v1.trainer_base.tq.kv_batch_put",
+        lambda **kwargs: written.append(kwargs["fields"]) or batch,
+    )
+    metrics = {}
+    PPOTrainer._compute_delta_policy_advantage(trainer, batch, metrics)
+    assert metrics["delta_policy/advantage_stats_count"] == 4
+    assert metrics["delta_policy/advantage_stats_mean"] == 2.0
+    assert metrics["delta_policy/advantage_stats_std"] == 1.0
+    assert written[-1]["row_weight"].tolist() == [1.0] * 4
+    assert written[-1]["advantages"][2].tolist() == [5.0, 5.0]
+    assert written[-1]["policy_loss_mask"][2].tolist() == [1.0, 1.0]
+    assert shared.exists()
+    trainer._delta_policy_stats = None
+    trainer.delta_policy_settings["advantage_stats_read_only"] = True
+    trainer.config.trainer.default_local_dir = str(tmp_path / "reader")
+    values[:] = [4.0, 6.0, -100.0, -200.0]
+    PPOTrainer._compute_delta_policy_advantage(trainer, batch, metrics)
+    assert metrics["delta_policy/advantage_stats_mean"] == 2.0
+    assert written[-1]["advantages"][0].tolist() == [2.0, 2.0]
+    assert (tmp_path / "reader" / "delta_advantage_stats.json").exists()
+    shared.unlink()
+    trainer._delta_policy_stats = None
+    with pytest.raises(ValueError, match="Shared original calibration is missing"):
+        PPOTrainer._compute_delta_policy_advantage(trainer, batch, metrics)
+
+
+def test_short_response_baseline_rows_must_be_binary_calibration_values():
+    batch = KVBatchMeta(keys=["short"], tags=[{}], partition_id="train")
+    data = {
+        "delta_reward_text_length": torch.tensor([1]),
+        "delta_reward_baseline": torch.tensor([-0.01]),
+    }
+    with pytest.raises(ValueError, match=r"baseline must be finite and in \[0, 1\]"):
+        PPOTrainer._short_response_reward_baselines(batch, data, short_response_budget=100, fallback_baseline=0.5)
+
+
 @pytest.mark.parametrize("stats_mode", ["per_rollout", "initial_rollout"])
 @pytest.mark.parametrize("continuation_actor_loss", [False, True])
+@pytest.mark.parametrize("kl_mask_scope", ["policy", "response"])
 def test_expansion_uses_delta_for_every_row_independent_of_true_rewards(
-    monkeypatch, tmp_path, stats_mode, continuation_actor_loss
+    monkeypatch, tmp_path, stats_mode, continuation_actor_loss, kl_mask_scope
 ):
     from examples.delta_critic.policy_loss import per_sample_policy_losses
 
@@ -313,6 +440,9 @@ def test_expansion_uses_delta_for_every_row_independent_of_true_rewards(
                 "delta_mc_record": {},
             }
         )
+    # Divergence before the first selected token must be visible in full-response
+    # diagnostics and regularized only when the response KL scope is requested.
+    rows[2]["ref_log_prob"][0] = -3.0
     for index in range(2):
         rows[index]["delta_mc_record"] = {
             "rollout": {
@@ -321,7 +451,11 @@ def test_expansion_uses_delta_for_every_row_independent_of_true_rewards(
                 "actor_version": "0",
             },
             "states": [{"token_index": 0}] if index == 0 else [],
-            "labels": [{"mc_continuations": [{"reward": 0.0}, {"reward": 0.0}]}] if index == 0 else [],
+            "labels": (
+                [{"token_index": 0, "v_prefix": 0.0, "mc_continuations": [{"reward": 0.0}, {"reward": 0.0}]}]
+                if index == 0
+                else []
+            ),
         }
     batch = KVBatchMeta(
         keys=[*keys, "padding"],
@@ -350,8 +484,9 @@ def test_expansion_uses_delta_for_every_row_independent_of_true_rewards(
         _validate_delta_rollout_versions=lambda batch: None,
         _tq_field_rows=PPOTrainer._tq_field_rows,
         _short_response_reward_deltas=PPOTrainer._short_response_reward_deltas,
+        _short_response_reward_baselines=PPOTrainer._short_response_reward_baselines,
         global_steps=1,
-        delta_policy_config=DeltaPolicyConfig.online(),
+        delta_policy_config=DeltaPolicyConfig.online(kl_mask_scope=kl_mask_scope),
         delta_policy_settings={
             "reference_policy_id": "initial",
             "advantage_stats_mode": stats_mode,
@@ -386,6 +521,7 @@ def test_expansion_uses_delta_for_every_row_independent_of_true_rewards(
             rows[index]["rm_scores"][-1] = reward
             rows[index + 2]["rm_scores"][-1] = reward
             rows[0]["delta_mc_record"]["labels"][0]["mc_continuations"][index]["reward"] = reward
+        rows[0]["delta_mc_record"]["labels"][0]["v_prefix"] = sum(rewards) / len(rewards)
         metrics = {}
         PPOTrainer._compute_delta_policy_advantage(trainer, batch, metrics)
         fields = written[-1]
@@ -393,7 +529,24 @@ def test_expansion_uses_delta_for_every_row_independent_of_true_rewards(
         assert fields["row_weight"].tolist() == [1.0, 1.0, 1.0, 1.0, 0.0]
         assert fields["critic_signal_mask"][2].tolist() == [0.0, 1.0, 0.0]
         assert fields["policy_loss_mask"][2].tolist() == ([0.0, 1.0, 1.0] if continuation_actor_loss else [0.0] * 3)
+        expected_kl_mask = [1.0, 1.0, 1.0] if kl_mask_scope == "response" else [0.0, 1.0, 1.0]
+        assert fields["kl_mask"][2].tolist() == (expected_kl_mask if continuation_actor_loss else [0.0] * 3)
+        assert fields["kl_mask"][4].tolist() == [0.0] * 3
         assert fields["advantages"][4].tolist() == [0.0] * 3
+        assert metrics["delta_policy/policy_token_coverage"] == pytest.approx(6 / 7 if continuation_actor_loss else 1.0)
+        outside_kl = metrics["delta_policy/preupdate_ref_kl_outside_policy_row_mean"]
+        assert outside_kl == pytest.approx(
+            torch.exp(torch.tensor(-2.0)).item() + 1.0 if continuation_actor_loss else 0.0
+        )
+        if continuation_actor_loss:
+            assert (
+                metrics["delta_policy/preupdate_ref_kl_response_row_mean"]
+                > metrics["delta_policy/preupdate_ref_kl_policy_row_mean"]
+            )
+        expected_zero_rows = rewards.count(0.0) * (2 if continuation_actor_loss else 1)
+        assert metrics["delta_policy/zero_reward_rows"] == expected_zero_rows
+        if rewards == [0.0, 0.0]:
+            assert metrics["delta_policy/zero_reward_positive_row_advantage_fraction"] == 0.5
         assert metrics["delta_policy/continuation_rows"] == 2
         assert metrics["delta_policy/continuation_advantage_from_critic"] == 1.0
         population = torch.tensor([1.0, 1.0, 3.0, 5.0, 5.0, 7.0] if continuation_actor_loss else [1.0, 1.0, 3.0])
@@ -415,6 +568,7 @@ def test_expansion_uses_delta_for_every_row_independent_of_true_rewards(
     torch.testing.assert_close(gradients[0], gradients[2], rtol=0, atol=0)
     if continuation_actor_loss:
         assert gradients[0][2, 1:].abs().sum() > 0
+        assert bool(gradients[0][2, 0].abs() > 0) == (kl_mask_scope == "response")
     else:
         assert gradients[0][2:].abs().sum() == 0
     if stats_mode == "initial_rollout":
@@ -426,8 +580,8 @@ def test_expansion_uses_delta_for_every_row_independent_of_true_rewards(
             PPOTrainer._compute_delta_policy_advantage(trainer, batch, {})
 
 
-def test_expansion_substitutes_short_response_rewards_then_clips_every_row(monkeypatch, tmp_path):
-    """Responses inside the budget carry their own reward; every row is then clipped."""
+def test_expansion_calibrates_short_outcomes_separately_then_clips_every_row(monkeypatch, tmp_path):
+    """Short outcomes use their sibling baseline and stay outside critic statistics."""
     keys = ["a", "b", "c", "d"]
     responses = [[20, 21], [30], [40, 41, 42], [50]]
     selected = [[0], [0], [1], [0]]
@@ -451,6 +605,9 @@ def test_expansion_substitutes_short_response_rewards_then_clips_every_row(monke
                 "delta_mc_record": {},
                 "delta_true_reward": torch.tensor(short[index][0]),
                 "delta_reward_text_length": torch.tensor(short[index][1]),
+                # c and d are leave-one-out siblings: c's baseline comes only
+                # from d, even though c's own observed reward is zero.
+                "delta_reward_baseline": torch.tensor([0.25, 0.5, 1.0, 0.0][index]),
             }
         )
     for index in range(2):
@@ -461,7 +618,11 @@ def test_expansion_substitutes_short_response_rewards_then_clips_every_row(monke
                 "actor_version": "0",
             },
             "states": [{"token_index": 0}] if index == 0 else [],
-            "labels": [{"mc_continuations": [{"reward": 0.0}, {"reward": 0.0}]}] if index == 0 else [],
+            "labels": (
+                [{"token_index": 0, "v_prefix": 0.0, "mc_continuations": [{"reward": 0.0}, {"reward": 0.0}]}]
+                if index == 0
+                else []
+            ),
         }
     batch = KVBatchMeta(
         keys=[*keys, "padding"],
@@ -493,8 +654,11 @@ def test_expansion_substitutes_short_response_rewards_then_clips_every_row(monke
         _validate_delta_rollout_versions=lambda batch: None,
         _tq_field_rows=PPOTrainer._tq_field_rows,
         _short_response_reward_deltas=PPOTrainer._short_response_reward_deltas,
+        _short_response_reward_baselines=PPOTrainer._short_response_reward_baselines,
         global_steps=1,
-        delta_policy_config=DeltaPolicyConfig.online(advantage_clip=1.0),
+        delta_policy_config=DeltaPolicyConfig.online(
+            advantage_clip=1.0, short_outcome_baseline=0.25, short_outcome_scale=0.25
+        ),
         delta_policy_settings={
             "reference_policy_id": "initial",
             "advantage_stats_mode": "initial_rollout",
@@ -526,24 +690,35 @@ def test_expansion_substitutes_short_response_rewards_then_clips_every_row(monke
     assert metrics["delta_policy/short_response_rows"] == 2
     assert metrics["delta_policy/short_response_positive_rows"] == 1
     assert metrics["delta_policy/short_response_mean_reward"] == pytest.approx(0.5)
+    assert metrics["delta_policy/short_response_mean_baseline"] == pytest.approx(0.625)
+    assert metrics["delta_policy/short_response_mean_advantage"] == pytest.approx(-0.5)
+    # Historical continuation rm_scores could be zero placeholders. Diagnose
+    # rewards from delta_true_reward whenever that authoritative field exists.
+    assert metrics["delta_policy/positive_reward_rows"] == 3
+    assert metrics["delta_policy/zero_reward_rows"] == 1
+    assert metrics["delta_policy/positive_reward_row_advantage_mean"] == pytest.approx(1 / 3)
+    assert metrics["delta_policy/zero_reward_row_advantage_mean"] == -1.0
     assert metrics["delta_policy/advantage_clip"] == pytest.approx(1.0)
-    assert metrics["delta_policy/clipped_advantage_tokens"] == 1
-    # Raw population: row a {1, 1}, row c {0, 0, 0}, plus the critic's 3 and 5.
-    population = torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 3.0, 5.0])
+    # Both complete short responses exceed the clip bound before clipping.
+    assert metrics["delta_policy/clipped_advantage_tokens"] == 5
+    # Critic population contains only ordinary rows b and d. Short outcomes use
+    # calibrated advantages in their own units and cannot move its mean or std.
+    population = torch.tensor([3.0, 5.0])
     mean, std = population.mean().item(), population.std(correction=0).item()
-    assert std > 0.0
-    assert fields["advantages"][0].tolist() == pytest.approx([(1.0 - mean) / std] * 2)
-    assert fields["advantages"][2].tolist() == pytest.approx([(0.0 - mean) / std] * 3)
-    # Row b keeps the critic's delta; row d is clipped down to the bound.
+    assert metrics["delta_policy/advantage_stats_count"] == 2
+    assert metrics["delta_policy/advantage_stats_mean"] == pytest.approx(mean)
+    assert metrics["delta_policy/advantage_stats_std"] == pytest.approx(std)
+    assert fields["advantages"][0].tolist() == [1.0, 1.0]
+    assert fields["advantages"][2].tolist() == [-1.0, -1.0, -1.0]
+    # Rows b and d retain their critic deltas and use critic-only statistics.
     assert fields["advantages"][1].tolist() == pytest.approx([(3.0 - mean) / std])
-    assert (5.0 - mean) / std > 1.0
     assert fields["advantages"][3].tolist() == [1.0]
     assert fields["state_mask"][0].tolist() == [1.0, 1.0]
     assert fields["policy_loss_mask"][2].tolist() == [1.0, 1.0, 1.0]
     assert fields["row_weight"].tolist() == [1.0, 1.0, 1.0, 1.0, 0.0]
     assert fields["advantages"][4].tolist() == [0.0] * 3
     stats_path = tmp_path / "delta_advantage_stats.json"
-    assert "short_reward_le100+advantage_clip_1.0" in stats_path.read_text()
+    assert "short_outcome_advantage_v2_le100_baseline0.25_scale0.25_loo_siblings_or_fixed" in stats_path.read_text()
 
 
 def test_delta_policy_config_survives_tq_and_reaches_actor_mini_batches(monkeypatch):

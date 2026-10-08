@@ -32,6 +32,18 @@ def online_policy_config(values: Mapping[str, Any]) -> DeltaPolicyConfig:
     return delta_policy_config_from_mapping(values, mode="online_ppo")
 
 
+def online_critic_updates_enabled(policy: Mapping[str, Any]) -> bool:
+    """Honor an explicit update switch while retaining legacy non-expansion MC."""
+    if policy.get("rollout_mode", "critic_prediction") != "selected_prefix_mc":
+        return False
+    update = policy.get("critic_update", {})
+    if "enabled" in update:
+        if not isinstance(update["enabled"], bool):
+            raise ValueError("critic_update.enabled must be a boolean")
+        return update["enabled"]
+    return not policy.get("expansion", {}).get("enabled", False)
+
+
 def validate_online_v1_settings(config: Mapping[str, Any]) -> DeltaPolicyConfig:
     """Fail early for online options that cannot preserve the PPO data contract."""
     policy = config.get("algorithm", {}).get("delta_policy", {})
@@ -46,6 +58,11 @@ def validate_online_v1_settings(config: Mapping[str, Any]) -> DeltaPolicyConfig:
         raise ValueError("advantage_stats_mode must be per_rollout or initial_rollout")
     if stats_mode == "initial_rollout" and loss_config.advantage_normalization != "standardize":
         raise ValueError("initial_rollout statistics require advantage_normalization=standardize")
+    stats_population = policy.get("advantage_stats_fit_population", "all")
+    if stats_population not in {"all", "originals"}:
+        raise ValueError("advantage_stats_fit_population must be all or originals")
+    if stats_population == "originals" and stats_mode != "initial_rollout":
+        raise ValueError("Original-only calibration requires fixed initial_rollout statistics")
     if not policy.get("critic_artifact"):
         raise ValueError("algorithm.delta_policy.critic_artifact is required")
     if not policy.get("reference_policy_id"):
@@ -105,8 +122,24 @@ def validate_online_v1_settings(config: Mapping[str, Any]) -> DeltaPolicyConfig:
         continuations = policy.get("mc", {}).get("continuations_per_state")
         if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in (prompts, states, continuations)):
             raise ValueError("Expansion prompt, state, and continuation budgets must be positive integers")
-        if states > prompts:
-            raise ValueError("Expansion requires at most one state per prompt")
+        protocol = expansion.get("protocol", {})
+        pair_layout = protocol.get("enabled", False) and protocol.get("sampling_layout") == "pair"
+        states_per_prompt = 2 if pair_layout else 1
+        if states > prompts * states_per_prompt:
+            raise ValueError("Expansion state budget exceeds its prompt allocation")
+        if protocol.get("enabled", False):
+            if protocol.get("sampling_layout") not in {"single", "pair"}:
+                raise ValueError("Matched expansion sampling_layout must be single or pair")
+            quotas = [protocol.get("train_prompts_per_step"), protocol.get("diagnostic_prompts_per_step")]
+            if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in quotas):
+                raise ValueError("Matched expansion prompt quotas must be positive integers")
+            if sum(quotas) * states_per_prompt != states:
+                raise ValueError("Matched expansion quotas do not equal its state budget")
+            if not protocol.get("partition_path") or not protocol.get("original_cache_dir"):
+                raise ValueError("Matched expansion requires fixed partition and original cache paths")
+            if online_critic_updates_enabled(policy):
+                if not pair_layout or policy.get("critic_update", {}).get("protocol") != "paired_fresh_v1":
+                    raise ValueError("Matched online updates require pair sampling and paired_fresh_v1")
         if config["data"]["train_batch_size"] != prompts + states * continuations:
             raise ValueError("Expansion train_batch_size must exactly equal originals plus continuations")
         if config["data"].get("gen_batch_size") != prompts:
@@ -129,18 +162,24 @@ def validate_online_v1_settings(config: Mapping[str, Any]) -> DeltaPolicyConfig:
             isinstance(short_response, bool) or not isinstance(short_response, int) or short_response < 1
         ):
             raise ValueError("Expansion short_response_tokens must be a positive integer or absent")
-    if loss_config.kl_mask_scope != "policy":
-        raise ValueError("Online V1 currently requires KL to use the selected policy-token mask")
     return loss_config
 
 
 def initial_advantage_stats(
-    path, *, reference_policy_id, critic_weights_sha256, label_mode, stats=None, advantage_contract=None
+    path,
+    *,
+    reference_policy_id,
+    critic_weights_sha256,
+    label_mode,
+    stats=None,
+    advantage_contract=None,
+    persist_pending=False,
 ):
-    """Load or atomically persist the immutable first-rollout statistics.
+    """Load or atomically persist the initial critic population statistics.
 
-    Kept beside the run's checkpoints so recovery never silently recalibrates
-    against a later policy. Bind the file to the reference and critic identities.
+    An all-short first rollout has no critic population, so it can persist a
+    pending identity marker. A later critic-bearing rollout fills that marker;
+    recovery still rejects missing or incompatible identities.
     """
     path = Path(path)
     identity = {
@@ -152,10 +191,29 @@ def initial_advantage_stats(
     }
     if advantage_contract is not None:
         identity["advantage_contract"] = advantage_contract
+
+    def persist(stats_value, *, pending):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {**identity, "stats": asdict(stats_value) if stats_value is not None else None}
+        if pending:
+            payload["stats_pending"] = True
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n")
+        temporary.replace(path)
+
     if path.exists():
         saved = json.loads(path.read_text())
         if any(saved.get(key) != value for key, value in identity.items()):
             raise ValueError("Initial advantage statistics belong to a different policy/critic contract")
+        if saved.get("stats") is None:
+            if saved.get("stats_pending") is not True:
+                raise ValueError("Initial advantage statistics file has no fitted or pending population")
+            if stats is not None:
+                if stats.population != "state_advantages":
+                    raise ValueError("Initial advantage statistics must describe state_advantages")
+                persist(stats, pending=False)
+                return stats
+            return None
         restored = NormalizationStats(**saved["stats"])
         if restored.population != "state_advantages":
             raise ValueError("Initial advantage statistics must describe state_advantages")
@@ -163,13 +221,12 @@ def initial_advantage_stats(
             raise ValueError("Cannot overwrite fixed initial advantage statistics")
         return restored
     if stats is None:
+        if persist_pending:
+            persist(None, pending=True)
         return None
     if stats.population != "state_advantages":
         raise ValueError("Initial advantage statistics must describe state_advantages")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps({**identity, "stats": asdict(stats)}, indent=2) + "\n")
-    temporary.replace(path)
+    persist(stats, pending=False)
     return stats
 
 
@@ -283,9 +340,7 @@ def create_frozen_delta_scorer(policy: Mapping[str, Any]):
 
     worker_class = FrozenDeltaWorker
     extra = {}
-    if policy.get("rollout_mode", "critic_prediction") == "selected_prefix_mc" and not policy.get("expansion", {}).get(
-        "enabled", False
-    ):
+    if online_critic_updates_enabled(policy):
         from .online_critic import OnlineDeltaWorker
 
         worker_class = OnlineDeltaWorker

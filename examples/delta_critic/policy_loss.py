@@ -245,4 +245,35 @@ def delta_policy_loss(model_output, data, dp_group=None):
             aggregation=AggregationType.SUM,
         ),
     }
+    # Observe the forward pass that produced this minibatch's loss. These are
+    # not post-update measurements: a single first minibatch has ratio == 1.
+    # Match the loss's row mean, global denominator and DP reduction exactly;
+    # rows without PG tokens contribute zero (see active_pg_row_fraction).
+    with torch.no_grad():
+        policy_mask = loss_batch["policy_loss_mask"].to(device=current.device, dtype=torch.float32)
+        advantages = loss_batch["advantages"].to(device=current.device, dtype=torch.float32)
+        raw_log_ratio = current.float() - loss_batch["old_log_probs"].to(current.device).float()
+        log_ratio = raw_log_ratio.clamp(-20.0, 20.0)
+        ratio = log_ratio.exp()
+        tokens = policy_mask.sum(dim=-1)
+        clipped = ratio.clamp(1.0 - config.clip_range, 1.0 + config.clip_range)
+        observations = {
+            "ratio_row_mean": ratio,
+            "ratio_abs_deviation_row_mean": (ratio - 1.0).abs(),
+            "log_ratio_row_mean": raw_log_ratio,
+            "abs_log_ratio_row_mean": raw_log_ratio.abs(),
+            "old_kl_row_mean": torch.expm1(-log_ratio) + log_ratio,
+            "clip_fraction_row_mean": (ratio * advantages > clipped * advantages).float(),
+            "ratio_outside_clip_fraction_row_mean": (ratio != clipped).float(),
+            "log_ratio_clamp_fraction_row_mean": (raw_log_ratio != log_ratio).float(),
+        }
+        for name, values in observations.items():
+            row_values = (values * policy_mask).sum(dim=-1) / tokens.clamp_min(1.0)
+            metrics[f"actor/delta_forward_{name}"] = Metric(
+                value=(row_values * row_weights).sum() * scale, aggregation=AggregationType.SUM
+            )
+        metrics["actor/delta_forward_active_pg_row_fraction"] = Metric(
+            value=((tokens > 0).float() * row_weights).sum() * scale,
+            aggregation=AggregationType.SUM,
+        )
     return total, metrics

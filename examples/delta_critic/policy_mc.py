@@ -49,8 +49,14 @@ def online_mc_config(policy, rollout, actor_version):
         "min_p": mc.get("min_p", 0.0),
         "max_tokens": max_tokens,
     }
-    if policy.get("expansion", {}).get("enabled", False):
-        sampling["delta_top_logprobs"] = int(policy.get("selection", {}).get("top_k_logprobs", 20))
+    selection = policy.get("selection", {})
+    save_continuations = mc.get("save_continuations", True)
+    top_k_logprobs = selection.get("top_k_logprobs")
+    if policy.get("expansion", {}).get("enabled", False) or (save_continuations and top_k_logprobs is not None):
+        top_k_logprobs = int(top_k_logprobs if top_k_logprobs is not None else 20)
+        if top_k_logprobs < 1:
+            raise ValueError("selection.top_k_logprobs must be positive when continuation metadata is requested")
+        sampling["delta_top_logprobs"] = top_k_logprobs
     if policy.get("label_mode", "selected_segment") != "selected_segment":
         raise ValueError("selected_prefix_mc requires label_mode=selected_segment")
     return MCConfig(
@@ -60,7 +66,7 @@ def online_mc_config(policy, rollout, actor_version):
         actor_version=str(actor_version),
         continuation_skip_special_tokens=True,
         save_individual_rewards=True,
-        save_continuations=mc.get("save_continuations", True),
+        save_continuations=save_continuations,
         max_total_tokens=max_total_tokens,
         max_response_total_tokens=max_response_total_tokens,
         require_nonempty=bool(policy.get("expansion", {}).get("enabled", False)),
@@ -185,6 +191,11 @@ def export_mc_records(records, directory):
                         "reward": completion["reward"],
                         "actor_version": label["mc_actor_version"],
                         "sampling_config": label["mc_sampling_config"],
+                        **(
+                            {"delta_top_logprobs": completion["delta_top_logprobs"]}
+                            if completion.get("delta_top_logprobs") is not None
+                            else {}
+                        ),
                     }
                 )
             tables["mc_labels_train"].append(label)

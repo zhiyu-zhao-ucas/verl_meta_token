@@ -17,7 +17,7 @@ from collections.abc import Mapping, Sequence
 from math import isfinite
 from typing import Any
 
-from .contracts import DeltaConfig, DeltaExample, NormalizationStats
+from .contracts import DeltaConfig, DeltaExample, NormalizationStats, TokenVector
 from .policy_config import DeltaPolicyConfig
 from .target_ops import clip_advantages, fit_normalization, normalize, state_advantages
 
@@ -112,6 +112,7 @@ def prepare_policy_rows(
     stats: NormalizationStats | None = None,
     fit_stats: bool = False,
     reward_deltas_by_id: Mapping[str, float] | None = None,
+    outcome_advantages_by_id: Mapping[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], NormalizationStats | None]:
     """Build response-aligned rows and optionally fit training-set statistics.
 
@@ -120,10 +121,11 @@ def prepare_policy_rows(
     or a possible legacy tail window. Evaluation rows should receive those saved
     statistics with ``stats=...`` and ``fit_stats=False``.
 
-    ``reward_deltas_by_id`` names rows whose raw delta is the realized outcome
-    reward covering the whole response instead of a critic prediction. Those
-    values join the same fit population and normalization as every other raw
-    delta, and ``config.advantage_clip`` bounds the normalized output afterwards.
+    ``reward_deltas_by_id`` is the legacy raw-reward replacement API. Its values
+    still join the critic fit population and normalization. New short-outcome
+    callers should pass ``outcome_advantages_by_id`` instead: those calibrated
+    advantages cover the whole response, bypass critic normalization, and are
+    excluded from fitted critic statistics.
     """
     if not examples:
         raise ValueError("At least one example is required")
@@ -132,10 +134,20 @@ def prepare_policy_rows(
         raise ValueError("Policy examples must have unique rollout IDs")
     if fit_stats and stats is not None:
         raise ValueError("Pass either existing stats or fit_stats=True, not both")
+    if reward_deltas_by_id is not None and outcome_advantages_by_id is not None:
+        raise ValueError("Do not mix legacy raw reward deltas with calibrated outcome advantages")
     if config.advantage_source == "mc_local_oracle" and config.label_mode != "paired_next_state":
         raise ValueError("mc_local_oracle requires label_mode='paired_next_state'")
     if config.mode == "online_ppo" and config.kl_coef > 0.0 and not reference_policy_id:
         raise ValueError("Online reference KL requires the immutable initial reference_policy_id")
+
+    rollout_ids_set = set(rollout_ids)
+    unknown_outcome_ids = set(outcome_advantages_by_id or {}) - rollout_ids_set
+    if unknown_outcome_ids:
+        raise ValueError(f"Outcome advantages name unknown rollout IDs: {sorted(unknown_outcome_ids)}")
+    calibrated_outcomes = {rollout_id: float(value) for rollout_id, value in (outcome_advantages_by_id or {}).items()}
+    if any(not isfinite(value) for value in calibrated_outcomes.values()):
+        raise ValueError("outcome_advantages_by_id must contain only finite values")
 
     delta_config = DeltaConfig(
         label_mode=config.label_mode,
@@ -167,23 +179,46 @@ def prepare_policy_rows(
         if fit_stats:
             # TransferQueue padding rows carry zero weight and never enter the
             # training-population statistics even if they duplicate real data.
+            # Calibrated whole-response outcome advantages are already in policy
+            # advantage units and never enter the critic-delta population.
             fit_vectors = [
                 vector
                 for example, vector in zip(examples, unnormalized, strict=True)
-                if float((row_weights_by_id or {}).get(example.rollout.rollout_id, 1.0)) > 0.0
+                if example.rollout.rollout_id not in calibrated_outcomes
+                and any(vector.mask)
+                and float((row_weights_by_id or {}).get(example.rollout.rollout_id, 1.0)) > 0.0
             ]
-            stats = fit_normalization(fit_vectors, population="state_advantages")
+            if fit_vectors:
+                stats = fit_normalization(fit_vectors, population="state_advantages")
         if stats is None:
-            raise ValueError("standardize requires fitted state-advantage stats")
-        advantages = [
-            normalize(vector, mode="standardize", population="state_advantages", stats=stats) for vector in unnormalized
-        ]
+            if any(
+                any(vector.mask)
+                and example.rollout.rollout_id not in calibrated_outcomes
+                and float((row_weights_by_id or {}).get(example.rollout.rollout_id, 1.0)) > 0.0
+                for example, vector in zip(examples, unnormalized, strict=True)
+            ):
+                raise ValueError("standardize requires fitted state-advantage stats for critic rows")
+            # An all-short batch has no critic population. Keep stats absent so a
+            # later batch with critic rows can fit the proper population.
+            advantages = list(unnormalized)
+        else:
+            advantages = [
+                normalize(vector, mode="standardize", population="state_advantages", stats=stats)
+                for vector in unnormalized
+            ]
     else:
         if fit_stats:
             raise ValueError("fit_stats=True requires advantage_normalization='standardize'")
         if stats is not None:
             raise ValueError("advantage_normalization='none' cannot consume normalization stats")
         advantages = unnormalized
+
+    for index, example in enumerate(examples):
+        rollout_id = example.rollout.rollout_id
+        if rollout_id in calibrated_outcomes:
+            value = calibrated_outcomes[rollout_id]
+            length = len(example.rollout.response_token_ids)
+            advantages[index] = TokenVector((value,) * length, (1.0,) * length)
 
     clip_limit = None if config.advantage_clip is None else float(config.advantage_clip)
     rows: list[dict[str, Any]] = []

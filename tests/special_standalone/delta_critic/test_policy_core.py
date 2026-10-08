@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 
 import pytest
 import torch
 
-from examples.delta_critic.contracts import DeltaConfig, DeltaExample, Rollout, SelectedState
+from examples.delta_critic.contracts import DeltaConfig, DeltaExample, NormalizationStats, Rollout, SelectedState
 from examples.delta_critic.policy_config import DeltaPolicyConfig, delta_policy_config_from_mapping
 from examples.delta_critic.policy_data import (
     policy_response_batch,
@@ -27,6 +28,7 @@ from examples.delta_critic.policy_data import (
     prepare_policy_rows,
 )
 from examples.delta_critic.policy_loss import delta_policy_loss, per_sample_policy_losses
+from examples.delta_critic.policy_online import initial_advantage_stats
 from examples.delta_critic.target_ops import state_advantages
 
 
@@ -65,6 +67,7 @@ def test_config_defaults_keep_historical_and_online_kl_contracts_separate():
     assert (online.kl_coef, online.kl_reference, online.kl_estimator) == (0.001, "reference", "low_var_kl")
     assert online.kl_mask_scope == "policy"
     assert online.behavior_logprob_source == "actor_snapshot"
+    assert (online.short_outcome_baseline, online.short_outcome_scale) == (0.5, 0.5)
     assert delta_policy_config_from_mapping({"delta_policy": {"clip_range": 0.1}}, mode="online_ppo").clip_range == 0.1
     with pytest.raises(ValueError, match="fixed reference policy"):
         DeltaPolicyConfig.online(kl_reference="behavior")
@@ -129,6 +132,91 @@ def test_short_response_reward_joins_the_same_standardization_as_critic_deltas()
     assert by_id["long"]["state_mask"] == (1.0, 1.0)
 
 
+def test_calibrated_outcome_advantages_bypass_critic_stats_and_all_short_batches_defer_fitting():
+    short = _example("short", [1], [2, 3, 4], [(0, 0.5)])
+    long = _example("long", [1], [2, 3], [(0, 0.1), (1, -0.3)])
+    behavior = {"short": [-0.1] * 3, "long": [-0.1] * 2}
+    predictions = {"short": {0: 20.0}, "long": {0: 0.1, 1: -0.3}}
+    config = DeltaPolicyConfig.online(kl_coef=0.0, advantage_clip=0.75)
+    fixed_stats = NormalizationStats(4.0, -0.0001, 0.0175, "state_advantages")
+
+    rows, returned_stats = prepare_policy_rows(
+        [short, long],
+        predictions,
+        behavior,
+        config,
+        stats=fixed_stats,
+        outcome_advantages_by_id={"short": -1.0},
+    )
+    by_id = {row["id"]: row for row in rows}
+    assert returned_stats == fixed_stats
+    # The short response spans every response token, including its last token.
+    # Its negative outcome advantage cannot become positive under critic centering.
+    assert by_id["short"]["state_mask"] == (1.0, 1.0, 1.0)
+    assert by_id["short"]["advantages"] == pytest.approx((-0.75, -0.75, -0.75))
+    assert by_id["short"]["advantage_clip_count"] == 3
+
+    mixed_rows, mixed_stats = prepare_policy_rows(
+        [short, long],
+        predictions,
+        behavior,
+        DeltaPolicyConfig.online(kl_coef=0.0),
+        outcome_advantages_by_id={"short": -1.0},
+        fit_stats=True,
+    )
+    # Only the two ordinary critic tokens define the fitted population.
+    assert mixed_stats is not None
+    assert (mixed_stats.count, mixed_stats.mean, mixed_stats.std) == pytest.approx((2.0, -0.1, 0.2))
+    assert {row["id"]: row for row in mixed_rows}["short"]["advantages"] == (-1.0, -1.0, -1.0)
+
+    short_peer = _example("short-peer", [1], [5], [(0, 0.2)])
+    all_short_rows, all_short_stats = prepare_policy_rows(
+        [short, short_peer],
+        {"short": {0: 20.0}, "short-peer": {0: -30.0}},
+        {"short": [-0.1] * 3, "short-peer": [-0.1]},
+        DeltaPolicyConfig.online(kl_coef=0.0),
+        outcome_advantages_by_id={"short": -1.0, "short-peer": 1.0},
+        fit_stats=True,
+    )
+    assert all_short_stats is None
+    assert [row["advantages"] for row in all_short_rows] == [(-1.0, -1.0, -1.0), (1.0,)]
+    preserved = NormalizationStats(2.0, 0.25, 0.75, "state_advantages")
+    _, preserved_stats = prepare_policy_rows(
+        [short, short_peer],
+        {"short": {0: 20.0}, "short-peer": {0: -30.0}},
+        {"short": [-0.1] * 3, "short-peer": [-0.1]},
+        DeltaPolicyConfig.online(kl_coef=0.0),
+        stats=preserved,
+        outcome_advantages_by_id={"short": -1.0, "short-peer": 1.0},
+    )
+    assert preserved_stats == preserved
+    # The next critic-bearing batch can fit normally once one exists.
+    _, later_stats = prepare_policy_rows(
+        [long],
+        {"long": {0: 0.1, 1: -0.3}},
+        {"long": [-0.1] * 2},
+        DeltaPolicyConfig.online(kl_coef=0.0),
+        fit_stats=True,
+    )
+    assert later_stats is not None and later_stats.count == 2
+
+
+def test_outcome_batch_with_unselected_critic_rows_defers_empty_population_fitting():
+    short = _example("short", [1], [2], [(0, 0.5)])
+    unselected = _example("unselected", [1], [3, 4], [])
+    rows, stats = prepare_policy_rows(
+        [short, unselected],
+        {"short": {0: -30.0}, "unselected": {}},
+        {"short": [-0.1], "unselected": [-0.1, -0.1]},
+        DeltaPolicyConfig.online(kl_coef=0.0),
+        outcome_advantages_by_id={"short": -1.0},
+        fit_stats=True,
+    )
+    assert stats is None
+    assert rows[0]["advantages"] == (-1.0,)
+    assert rows[1]["policy_loss_mask"] == (0.0, 0.0)
+
+
 def test_advantage_clip_bounds_normalized_rows_and_reports_them():
     examples = [
         _example("short", [1], [2, 3], [(0, 0.5)]),
@@ -152,6 +240,41 @@ def test_advantage_clip_bounds_normalized_rows_and_reports_them():
     assert by_id["long"]["advantage_clip_count"] == 2
     with pytest.raises(ValueError, match="advantage_clip"):
         DeltaPolicyConfig.online(kl_coef=0.0, advantage_clip=0.0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("short_outcome_baseline", float("nan"), "baseline"),
+        ("short_outcome_baseline", 1.1, "baseline"),
+        ("short_outcome_scale", float("inf"), "scale"),
+        ("short_outcome_scale", 0.0, "scale"),
+    ],
+)
+def test_short_outcome_calibration_config_is_validated(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        DeltaPolicyConfig.online(**{field: value})
+
+
+def test_initial_advantage_stats_preserve_pending_all_short_contract_then_fit(tmp_path):
+    path = tmp_path / "delta_advantage_stats.json"
+    identity = {
+        "reference_policy_id": "initial",
+        "critic_weights_sha256": "frozen",
+        "label_mode": "selected_segment",
+        "advantage_contract": "short_outcome_advantage_v2_baseline0.5_scale0.5",
+    }
+    assert initial_advantage_stats(path, **identity) is None
+    assert initial_advantage_stats(path, **identity, persist_pending=True) is None
+    assert json.loads(path.read_text())["stats_pending"] is True
+    assert initial_advantage_stats(path, **identity) is None
+
+    fitted = NormalizationStats(2.0, 0.0, 0.5, "state_advantages")
+    assert initial_advantage_stats(path, **identity, stats=fitted) == fitted
+    assert initial_advantage_stats(path, **identity) == fitted
+    incompatible = {**identity, "advantage_contract": "short_reward_le100_v1"}
+    with pytest.raises(ValueError, match="different policy/critic contract"):
+        initial_advantage_stats(path, **incompatible)
 
 
 def test_offline_advantages_collation_and_loss_match_value_model_source():

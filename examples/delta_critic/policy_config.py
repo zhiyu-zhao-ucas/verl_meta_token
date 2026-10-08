@@ -44,6 +44,11 @@ class DeltaPolicyConfig:
     # Symmetric bound applied to state advantages AFTER normalization. It covers
     # every row, so one outlier delta cannot dominate an update.
     advantage_clip: float | None = None
+    # Binary outcome advantage calibration for short responses. A per-row
+    # continuation baseline may override the fallback baseline, but the scale is
+    # always shared so outcomes remain independent of critic normalization.
+    short_outcome_baseline: float = 0.5
+    short_outcome_scale: float = 0.5
     # ``row_mean`` gives each logical row equal mass regardless of response
     # length. row_weight supports source sampler repeat/subsample weights.
     aggregation: Literal["row_mean"] = "row_mean"
@@ -111,6 +116,12 @@ class DeltaPolicyConfig:
                 raise ValueError("train_logprob_temperature must be positive")
             if name == "kl_coef" and value < 0.0:
                 raise ValueError("kl_coef must be nonnegative")
+        baseline = float(self.short_outcome_baseline)
+        scale = float(self.short_outcome_scale)
+        if not isfinite(baseline) or not 0.0 <= baseline <= 1.0:
+            raise ValueError("short_outcome_baseline must be finite and in [0, 1]")
+        if not isfinite(scale) or scale <= 0.0:
+            raise ValueError("short_outcome_scale must be positive and finite")
         if self.max_length is not None and (
             isinstance(self.max_length, bool) or not isinstance(self.max_length, int) or self.max_length < 2
         ):
