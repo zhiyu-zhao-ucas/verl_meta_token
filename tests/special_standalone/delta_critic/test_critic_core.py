@@ -202,3 +202,215 @@ def test_v1_loss_callback_reports_sample_mean_and_coverage_metrics():
     assert metrics["critic/signal_tokens"].aggregate() == pytest.approx(2.0)
     assert metrics["critic/background_tokens"].aggregate() == pytest.approx(1.0)
     assert metrics["critic/input_tokens"].aggregate() == pytest.approx(5.0)
+
+
+def test_terminal_defaults_keep_legacy_semantics_and_selection_defaults():
+    config = ScalarConfig("unused")
+    assert config.terminal_normalization == "independent"
+    assert config.terminal_length_weighting == "none"
+    assert config.hybrid_reduction == "all_samples"
+    assert config.continuation_selection == "uniform"
+    assert config.continuation_max_candidates == 5
+
+    with pytest.raises(ValueError, match="terminal_length_weighting"):
+        ScalarConfig("unused", terminal_length_weighting="per_token")
+    with pytest.raises(ValueError, match="continuation_selection"):
+        ScalarConfig("unused", continuation_selection="topk")
+    with pytest.raises(ValueError, match="continuation_max_candidates"):
+        ScalarConfig("unused", continuation_max_candidates=0)
+    with pytest.raises(ValueError, match="continuation_max_candidates"):
+        ScalarConfig("unused", continuation_max_candidates=1.5)
+
+
+def test_inverse_count_uses_raw_sum_k_times_mean_and_masks_padding_and_invalid_rows():
+    config = ScalarConfig(
+        "unused",
+        objective="hybrid_terminal_composition",
+        terminal_normalization="td",
+        terminal_length_weighting="inverse_count",
+        terminal_weight=1.7,
+        max_length=4,
+    )
+    batch = {
+        "target": torch.zeros((3, 4)),
+        "target_mask": torch.zeros((3, 4)),
+        "signal_mask": torch.zeros((3, 4)),
+        "sample_valid_mask": torch.tensor([1.0, 1.0, 0.0]),
+        "terminal_comp_valid": torch.tensor([1.0, 1.0, 1.0]),
+        "terminal_comp_target": torch.tensor([4.0, 1.0, float("nan")]),
+        "terminal_suffix_positions": torch.tensor([[0, 2], [1, -1], [999, -1]]),
+        "terminal_suffix_mask": torch.tensor([[1.0, 1.0], [1.0, 0.0], [1.0, 0.0]]),
+    }
+    normalization = {"enabled": True, "mode": "standardize", "mean": 0.5, "std": 2.0}
+    pred = torch.tensor(
+        [[0.25, 8.0, 0.75, -8.0], [0.0, -0.25, 8.0, 8.0], [5.0, 5.0, 5.0, 5.0]],
+        requires_grad=True,
+    )
+
+    losses, valid, _, terminal = per_sample_loss(pred, batch, config, normalization)
+    # Each selected prediction is returned to raw units before summation: row 0
+    # is (2 * .25 + .5) + (2 * .75 + .5) = 3, including K * mean.
+    residual_0 = (2 * 0.25 + 0.5) + (2 * 0.75 + 0.5) - 4.0
+    residual_1 = (2 * -0.25 + 0.5) - 1.0
+    expected_terminal = torch.tensor([0.5 * (residual_0 / 2) ** 2, 0.5 * (residual_1 / 2) ** 2, 0.0])
+    expected_losses = config.terminal_weight * expected_terminal * torch.tensor([0.5, 1.0, 0.0])
+    torch.testing.assert_close(terminal, expected_terminal)
+    torch.testing.assert_close(losses, expected_losses)
+    assert valid.tolist() == [True, True, False]
+
+    expected_pred = pred.detach().clone().requires_grad_()
+    expected_raw_0 = (2 * expected_pred[0, 0] + 0.5) + (2 * expected_pred[0, 2] + 0.5)
+    expected_raw_1 = 2 * expected_pred[1, 1] + 0.5
+    literal = config.terminal_weight * (
+        0.5 * ((expected_raw_0 - 4.0) / 2.0).square() / 2 + 0.5 * ((expected_raw_1 - 1.0) / 2.0).square()
+    )
+    actual_gradient = torch.autograd.grad(losses.sum(), pred)[0]
+    expected_gradient = torch.autograd.grad(literal, expected_pred)[0]
+    torch.testing.assert_close(actual_gradient, expected_gradient)
+    assert torch.isfinite(losses).all()
+    assert torch.equal(actual_gradient[2], torch.zeros_like(actual_gradient[2]))
+
+
+def test_terminal_independent_std_matches_equivalent_td_scale_weight():
+    normalization = {"enabled": True, "mode": "standardize", "mean": 0.25, "std": 2.0}
+    batch = {
+        "target": torch.zeros((1, 3)),
+        "target_mask": torch.zeros((1, 3)),
+        "signal_mask": torch.zeros((1, 3)),
+        "terminal_comp_valid": torch.tensor([1.0]),
+        "terminal_comp_target": torch.tensor([2.0]),
+        "terminal_suffix_positions": torch.tensor([[0, 2]]),
+        "terminal_suffix_mask": torch.tensor([[1.0, 1.0]]),
+    }
+    pred = torch.tensor([[0.0, -1.0, 0.5]], requires_grad=True)
+    independent = ScalarConfig(
+        "unused",
+        objective="hybrid_terminal_composition",
+        terminal_normalization="independent",
+        terminal_weight=0.25,
+        max_length=3,
+    )
+    td_scaled = ScalarConfig(
+        "unused",
+        objective="hybrid_terminal_composition",
+        terminal_normalization="td",
+        terminal_weight=4.0,
+        max_length=3,
+    )
+    stats = {"count": 2, "mean": 0.0, "std": 0.5}
+    independent_loss, _, _, _ = per_sample_loss(pred, batch, independent, normalization, stats)
+    td_loss, _, _, _ = per_sample_loss(pred, batch, td_scaled, normalization, None)
+    torch.testing.assert_close(independent_loss, td_loss)
+    independent_grad = torch.autograd.grad(independent_loss.sum(), pred, retain_graph=True)[0]
+    td_grad = torch.autograd.grad(td_loss.sum(), pred)[0]
+    torch.testing.assert_close(independent_grad, td_grad)
+
+
+@pytest.mark.parametrize("std", [0.0, -1.0, float("inf"), float("nan")])
+def test_enabled_td_normalization_requires_finite_positive_scale(std):
+    config = ScalarConfig("unused", max_length=2)
+    batch = {
+        "target": torch.zeros((1, 2)),
+        "target_mask": torch.ones((1, 2)),
+        "signal_mask": torch.zeros((1, 2)),
+    }
+    with pytest.raises(ValueError, match="finite positive std"):
+        per_sample_loss(
+            torch.zeros((1, 2)),
+            batch,
+            config,
+            {"enabled": True, "mean": 0.0, "std": std},
+        )
+
+
+def test_separate_sample_inverse_count_reduction_preserves_dp_microbatch_gradients_and_raw_metrics():
+    from tensordict import TensorDict
+
+    from verl.utils import tensordict_utils as tu
+
+    config = ScalarConfig(
+        "unused",
+        objective="hybrid_terminal_composition",
+        terminal_normalization="td",
+        terminal_length_weighting="inverse_count",
+        hybrid_reduction="separate_samples",
+        td_weight=0.3,
+        terminal_weight=0.7,
+        max_length=4,
+    )
+    normalization = {"enabled": True, "mode": "standardize", "mean": 0.5, "std": 2.0}
+    batch = TensorDict(
+        {
+            "target": torch.zeros((4, 4)),
+            "target_mask": torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0] * 4, [1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]),
+            "signal_mask": torch.zeros((4, 4)),
+            "attention_mask": torch.ones((4, 4)),
+            "sample_valid_mask": torch.tensor([1.0, 1.0, 1.0, 0.0]),
+            "terminal_comp_valid": torch.tensor([1.0, 1.0, 0.0, 1.0]),
+            "terminal_comp_target": torch.tensor([3.5, -0.5, 0.0, float("nan")]),
+            "terminal_suffix_positions": torch.tensor([[1, 3], [2, -1], [-1, -1], [999, -1]]),
+            "terminal_suffix_mask": torch.tensor([[1.0, 1.0], [1.0, 0.0], [0.0, 0.0], [1.0, 0.0]]),
+        },
+        batch_size=[4],
+    )
+    coefficient = torch.tensor(0.4, requires_grad=True)
+    features = torch.tensor(
+        [[0.5, 1.0, -0.5, 1.5], [0.25, -0.25, 0.75, 1.0], [0.5, 1.5, -0.75, 0.25], [1.0, 1.0, 1.0, 1.0]]
+    )
+    pred = coefficient * features
+    td_rows = 0.5 * (pred[[0, 2], 0]).square()
+    raw_row_0 = (2 * pred[0, 1] + 0.5) + (2 * pred[0, 3] + 0.5)
+    raw_row_1 = 2 * pred[1, 2] + 0.5
+    residuals = torch.stack([raw_row_0 - 3.5, raw_row_1 - (-0.5)])
+    unweighted_terminal = 0.5 * (residuals / 2.0).square()
+    expected = (
+        config.td_weight * td_rows.mean()
+        + config.terminal_weight * (unweighted_terminal * torch.tensor([0.5, 1.0])).mean()
+    )
+    expected_gradient = torch.autograd.grad(expected, coefficient, retain_graph=True)[0]
+
+    def run(dp_size, microbatch):
+        rank_losses = []
+        reference_metrics = None
+        for rank in range(dp_size):
+            indices = list(range(rank, len(batch), dp_size))
+            rank_loss = coefficient.new_zeros(())
+            for start in range(0, len(indices), microbatch):
+                selected = indices[start : start + microbatch]
+                micro = batch[selected].clone()
+                tu.assign_non_tensor(
+                    micro,
+                    delta_config=config.as_dict(),
+                    normalization=normalization,
+                    terminal_stats=None,
+                    dp_size=dp_size,
+                    valid_sample_count=3,
+                    td_sample_count=2,
+                    terminal_sample_count=2,
+                )
+                loss, metrics = delta_loss({"delta_scalar": pred[selected]}, micro)
+                rank_loss = rank_loss + loss
+                if dp_size == 1 and microbatch == 4:
+                    reference_metrics = metrics
+            rank_losses.append(rank_loss)
+        return sum(rank_losses) / dp_size, reference_metrics
+
+    reference_loss, reference_metrics = run(dp_size=1, microbatch=4)
+    torch.testing.assert_close(reference_loss, expected)
+    for dp_size, microbatch in ((1, 1), (1, 2), (2, 1), (2, 2)):
+        reduced, _ = run(dp_size=dp_size, microbatch=microbatch)
+        actual_gradient = torch.autograd.grad(reduced, coefficient, retain_graph=True)[0]
+        torch.testing.assert_close(reduced, expected)
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=1e-7)
+
+    assert reference_metrics["critic/terminal_count"].aggregate() == pytest.approx(2.0)
+    assert reference_metrics["critic/terminal_suffix_count"].aggregate() == pytest.approx(3.0)
+    assert reference_metrics["critic/terminal_raw_squared_error"].aggregate() == pytest.approx(
+        float(residuals.detach().square().sum())
+    )
+    assert reference_metrics["critic/terminal_loss"].aggregate() == pytest.approx(
+        float(unweighted_terminal.detach().mean())
+    )
+    assert reference_metrics["critic/terminal_optimization_loss"].aggregate() == pytest.approx(
+        float((config.terminal_weight * unweighted_terminal * torch.tensor([0.5, 1.0])).mean().detach())
+    )

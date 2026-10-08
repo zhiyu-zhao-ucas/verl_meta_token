@@ -86,7 +86,9 @@ def test_batch_sample_v1_uncertainty_to_paired_mc():
 
         async def generate(self, **kwargs):
             self.calls.append(kwargs)
-            return SimpleNamespace(token_ids=[30])
+            return SimpleNamespace(
+                token_ids=[30], extra_fields={"delta_top_logprobs": [[{"token_id": 30, "prob": 0.7}]]}
+            )
 
     client = Client()
     rollout, states, labels = asyncio.run(
@@ -133,7 +135,9 @@ def test_v1_mc_continuations_keep_sample_order_under_global_limit():
             self.peak = max(self.peak, self.active)
             await asyncio.sleep((4 - index) * 0.001)
             self.active -= 1
-            return SimpleNamespace(token_ids=[index])
+            return SimpleNamespace(
+                token_ids=[index], extra_fields={"delta_top_logprobs": [[{"token_id": index, "prob": 0.7}]]}
+            )
 
     class Tokenizer:
         def decode(self, ids, *, skip_special_tokens):
@@ -207,7 +211,7 @@ def test_v1_native_mc_outputs_follow_completion_indices():
     ("mc_sampling_mode", "batch_size", "expected_peak"),
     [
         ("requests", None, 2),
-        ("native", None, 1),
+        ("native", None, 2),
         ("native", 1, 2),
     ],
 )
@@ -255,7 +259,10 @@ def test_collect_labeled_rollouts_overlaps_rollout_and_mc_with_global_limit(
             self.mc_counts.append(count)
             await asyncio.sleep(0.002)
             self.active_mc -= 1
-            return SimpleNamespace(token_ids=[30], extra_fields={"delta_mc_token_ids": [[30] for _ in range(count)]})
+            return SimpleNamespace(
+                token_ids=[30],
+                extra_fields={"delta_top_logprobs": [[{"token_id": 30, "prob": 0.7}]]},
+            )
 
     client = Client()
     collected = []
@@ -288,7 +295,7 @@ def test_collect_labeled_rollouts_overlaps_rollout_and_mc_with_global_limit(
     assert len(streamed_rollouts) == 3
     assert len(streamed_labels) == 3
     assert client.peak_mc == expected_peak
-    expected_counts = [1] * 9 if batch_size == 1 or mc_sampling_mode == "requests" else [1] * 3 + [2] * 3
+    expected_counts = [1] * 9
     assert sorted(client.mc_counts) == expected_counts
 
 

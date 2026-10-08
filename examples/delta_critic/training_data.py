@@ -19,6 +19,7 @@ from collections import Counter
 import torch
 from torch.utils.data import Dataset
 
+from .mc_labeling import validate_delta_top_logprobs
 from .target_ops import critic_targets, selected_labels
 
 
@@ -144,8 +145,41 @@ def continuation_rows(continuations, labels, config, excluded_rollout_ids=()):
             prefix = list(label.get("prefix_response_token_ids") or row.get("prefix_response_token_ids") or [])
             if not prompt:
                 raise ValueError("Continuation requires original prompt token IDs")
-            step = max(1, config.continuation_min_gap, math.ceil(len(response) / config.continuation_state_count))
-            selected = list(range(0, len(response), step))[: config.continuation_state_count]
+            selection = getattr(config, "continuation_selection", "uniform")
+            if selection == "uniform":
+                step = max(1, config.continuation_min_gap, math.ceil(len(response) / config.continuation_state_count))
+                selected = list(range(0, len(response), step))[: config.continuation_state_count]
+            elif selection == "uncertainty":
+                top_logprobs = row.get("delta_top_logprobs")
+                if top_logprobs is None:
+                    continuation_id = row.get("continuation_id", "<unknown>")
+                    raise ValueError(
+                        "continuation_selection='uncertainty' requires stored token-aligned actor "
+                        f"delta_top_logprobs for continuation {continuation_id!r}; rescore this dataset first"
+                    )
+                validate_delta_top_logprobs(
+                    response,
+                    top_logprobs,
+                    context=f"Continuation {row.get('continuation_id', '<unknown>')!r}",
+                )
+                from .policy_online import select_uncertainty_indices
+
+                count = config.continuation_state_count
+                gap = config.continuation_min_gap
+                # The terminal anchor consumes one budget slot. Masking nearby
+                # positions before the shared selector lets it refill the
+                # remaining slots while retaining the policy's score/tie-break.
+                policy_mask = [float(index >= gap and index != 0) for index in range(len(response))]
+                uncertain = select_uncertainty_indices(
+                    top_logprobs,
+                    policy_mask,
+                    states_per_response=max(0, count - 1),
+                    min_token_gap=gap,
+                    max_candidates=getattr(config, "continuation_max_candidates", 5),
+                )
+                selected = sorted({0, *uncertain})[:count]
+            else:
+                raise ValueError(f"Unsupported continuation_selection={selection!r}")
             rows.append(
                 {
                     "id": row.get("continuation_id") or f"{label.get('state_id')}:{len(rows)}",

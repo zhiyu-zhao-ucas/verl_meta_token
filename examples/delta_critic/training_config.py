@@ -40,6 +40,11 @@ class ScalarConfig:
     window_policy: str = "full"
     td_weight: float = 1.0
     terminal_weight: float = 1.0
+    terminal_normalization: str = "independent"
+    terminal_length_weighting: str = "none"
+    hybrid_reduction: str = "all_samples"
+    continuation_selection: str = "uniform"
+    continuation_max_candidates: int = 5
     continuation_state_count: int = 64
     continuation_min_gap: int = 32
     continuation_budget: int | None = None
@@ -52,6 +57,14 @@ class ScalarConfig:
 
     def __post_init__(self):
         self.contract()
+        if self.terminal_normalization not in {"independent", "td"}:
+            raise ValueError("terminal_normalization must be independent or td")
+        if self.terminal_length_weighting not in {"none", "inverse_count"}:
+            raise ValueError("terminal_length_weighting must be none or inverse_count")
+        if self.hybrid_reduction not in {"all_samples", "separate_samples"}:
+            raise ValueError("hybrid_reduction must be all_samples or separate_samples")
+        if self.continuation_selection not in {"uniform", "uncertainty"}:
+            raise ValueError("continuation_selection must be uniform or uncertainty")
         if self.objective not in {"local_td0", "hybrid_terminal_composition"}:
             raise ValueError(f"Unsupported objective: {self.objective}")
         if self.loss_type not in {"mse", "nonzero_balanced_mse"}:
@@ -71,10 +84,18 @@ class ScalarConfig:
             raise ValueError("max_length must be positive when specified")
         if self.window_policy == "legacy_tail" and self.max_length is None:
             raise ValueError("legacy_tail requires an explicit max_length")
-        if not self.model_path or self.continuation_state_count < 1 or self.continuation_min_gap < 0:
-            raise ValueError("Model path and positive continuation selection budget required")
-        if self.continuation_budget is not None and self.continuation_budget < 1:
-            raise ValueError("continuation_budget must be positive")
+        if not self.model_path:
+            raise ValueError("Model path is required")
+        if type(self.continuation_state_count) is not int or self.continuation_state_count < 1:
+            raise ValueError("continuation_state_count must be a positive integer")
+        if type(self.continuation_min_gap) is not int or self.continuation_min_gap < 0:
+            raise ValueError("continuation_min_gap must be a nonnegative integer")
+        if type(self.continuation_max_candidates) is not int or self.continuation_max_candidates < 1:
+            raise ValueError("continuation_max_candidates must be a positive integer")
+        if self.continuation_budget is not None and (
+            type(self.continuation_budget) is not int or self.continuation_budget < 1
+        ):
+            raise ValueError("continuation_budget must be a positive integer")
         for key in ("td_weight", "terminal_weight", "learning_rate", "weight_decay", "gradient_clip"):
             value = getattr(self, key)
             if not math.isfinite(value) or value < 0:

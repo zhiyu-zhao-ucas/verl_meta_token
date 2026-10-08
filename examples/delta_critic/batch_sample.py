@@ -58,6 +58,9 @@ def sampling_settings(config: dict, mode: str) -> tuple[dict, MCConfig]:
         "top_p": float(mc["top_p"]),
         "max_tokens": int(mc["max_continuation_tokens"]),
     }
+    save_continuations = bool(mc.get("save_continuations", False))
+    if save_continuations and rollout.get("top_k_logprobs") is not None:
+        mc_sampling["delta_top_logprobs"] = int(rollout["top_k_logprobs"])
     for key in ("top_k", "min_p"):
         if mc.get(key) is not None:
             mc_sampling[key] = int(mc[key]) if key == "top_k" else float(mc[key])
@@ -70,7 +73,7 @@ def sampling_settings(config: dict, mode: str) -> tuple[dict, MCConfig]:
         treat_length_truncation_as_terminal=bool(mc.get("treat_length_truncation_as_terminal", True)),
         assume_legacy_last_token_terminal=False,
         save_individual_rewards=bool(mc.get("save_individual_rewards", False)),
-        save_continuations=bool(mc.get("save_continuations", False)),
+        save_continuations=save_continuations,
     )
     if int(selection["max_candidates"]) > int(rollout["top_k_logprobs"]):
         raise ValueError("max_candidates cannot exceed top_k_logprobs")
@@ -385,6 +388,10 @@ async def collect_labeled_rollouts(
         if mc_sampling_mode == "native"
         else None
     )
+    if mc_config.save_continuations and mc_config.sampling_config.get("delta_top_logprobs") is not None:
+        # Native n-sample responses expose token IDs only; individual requests
+        # are needed to retain one actor top-k row per continuation token.
+        mc_native_n_batch_size = None
     mc_request_limit = (
         max(1, mc_concurrency // mc_native_n_batch_size) if mc_native_n_batch_size is not None else mc_concurrency
     )
@@ -726,6 +733,11 @@ async def run(
                             "continuation_num_tokens": len(token_ids),
                             "empty_continuation": not token_ids,
                             "reward": continuation["reward"],
+                            **(
+                                {"delta_top_logprobs": continuation["delta_top_logprobs"]}
+                                if continuation.get("delta_top_logprobs") is not None
+                                else {}
+                            ),
                             "actor_version": mc_config.actor_version,
                             "sampling_config": dict(mc_config.sampling_config),
                         },

@@ -137,11 +137,27 @@ class DeltaFSDPEngine(FSDPEngine):
         sample_valid = data.get("sample_valid_mask")
         if sample_valid is None:
             sample_valid = torch.ones(data.shape[0], dtype=torch.float32, device=data.device)
-        count = sample_valid.float().sum().to(torch.cuda.current_device())
-        torch.distributed.all_reduce(count, group=self.get_data_parallel_group())
-        if not forward_only and count.item() == 0:
+        valid = sample_valid.bool()
+        target_mask = data.get("target_mask")
+        terminal_valid = data.get("terminal_comp_valid")
+        td_valid = valid & (target_mask.sum(-1) > 0) if target_mask is not None else torch.zeros_like(valid)
+        terminal_valid = valid & terminal_valid.bool() if terminal_valid is not None else torch.zeros_like(valid)
+        counts = torch.stack(
+            [
+                valid.float().sum(),
+                td_valid.float().sum(),
+                terminal_valid.float().sum(),
+            ]
+        ).to(torch.cuda.current_device())
+        torch.distributed.all_reduce(counts, group=self.get_data_parallel_group())
+        if not forward_only and counts[0].item() == 0:
             raise ValueError("Update has no real samples")
-        tu.assign_non_tensor(data, valid_sample_count=count.item())
+        tu.assign_non_tensor(
+            data,
+            valid_sample_count=counts[0].item(),
+            td_sample_count=counts[1].item(),
+            terminal_sample_count=counts[2].item(),
+        )
         return super().forward_backward_batch(data, loss_function, forward_only)
 
     def forward_step(self, micro_batch, loss_function, forward_only):

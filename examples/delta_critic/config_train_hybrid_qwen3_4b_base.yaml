@@ -1,6 +1,7 @@
-# Offline critic recipe for budgeted 4B policy-expansion collections.
-# Keep collection and critic fitting as separate jobs. The CLI must supply
-# the effective global batch and update budget after choosing round attempts.
+# Full-context hybrid recipe for the original 4B offline collection.
+# Initialize from its TD artifact with the same TD labels/split/normalization.
+# Legacy continuations need collection-actor probabilities added by
+# examples.delta_critic.rescore_continuations before uncertainty selection.
 model_path: Qwen/Qwen3-4B-Base
 dtype: bfloat16
 attention_implementation: sdpa
@@ -10,8 +11,7 @@ loss_type: nonzero_balanced_mse
 loss_mask: response
 delta_label_mode: selected_segment
 target_normalization: standardize
-# Prompt <= 2048 and response prefix + continuation <= 2048.
-max_length: 4096
+max_length: null
 window_policy: full
 gradient_checkpointing: true
 learning_rate: 1.0e-5
@@ -20,7 +20,6 @@ gradient_clip: 1.0
 seed: 42
 td_weight: 1.0
 terminal_weight: 0.003
-# Keep one TD inverse transform; control terminal strength outside the raw sum.
 terminal_normalization: td
 terminal_length_weighting: inverse_count
 hybrid_reduction: separate_samples
@@ -28,4 +27,5 @@ continuation_selection: uncertainty
 continuation_max_candidates: 5
 continuation_state_count: 64
 continuation_min_gap: 32
-continuation_budget: 8
+# Use every stored MC branch; update budget remains an explicit CLI choice.
+continuation_budget: null

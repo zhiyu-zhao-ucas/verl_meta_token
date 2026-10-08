@@ -15,6 +15,7 @@
 
 import argparse
 import json
+import math
 import os
 import random
 from dataclasses import replace
@@ -131,6 +132,34 @@ class RowIterator:
         return {"epoch": self.epoch, "cursor": self.cursor}
 
 
+class HybridRowIterator:
+    """Sample a fixed number of TD and terminal rows per optimizer update."""
+
+    def __init__(self, td_size, terminal_size, seed, td_per_batch, global_batch, state=None):
+        if not 0 < td_per_batch < global_batch:
+            raise ValueError("TD rows per batch must be between zero and global_batch")
+        state = state or {}
+        self.td = RowIterator(td_size, seed, state.get("epoch", 0), state.get("cursor", 0))
+        self.terminal = RowIterator(
+            terminal_size, seed + 1, state.get("terminal_epoch", 0), state.get("terminal_cursor", 0)
+        )
+        self.td_size, self.td_per_batch, self.global_batch = td_size, td_per_batch, global_batch
+
+    def take(self, count):
+        if count != self.global_batch:
+            raise ValueError("Hybrid iterator requires the configured global batch")
+        return self.td.take(self.td_per_batch) + [
+            self.td_size + index for index in self.terminal.take(count - self.td_per_batch)
+        ]
+
+    def state(self):
+        return {
+            **self.td.state(),
+            "terminal_epoch": self.terminal.epoch,
+            "terminal_cursor": self.terminal.cursor,
+        }
+
+
 def evaluate(worker, rows, config, normalization, terminal_stats, pad, microbatch):
     from verl.utils import tensordict_utils as tu
 
@@ -156,8 +185,43 @@ def evaluate(worker, rows, config, normalization, terminal_stats, pad, microbatc
         "loss": losses["critic/total_loss"],
         "td_loss": losses["critic/td_loss"],
         "terminal_loss": losses["critic/terminal_loss"],
+        **terminal_validation_metrics(losses, rows, config=config),
         "coverage": coverage,
         "rows": len(rows),
+    }
+
+
+def terminal_validation_metrics(metrics, rows, *, config=None):
+    """Compare raw terminal prediction error with zero, regardless of loss weights."""
+    count = metrics["critic/terminal_count"]
+    targets = []
+    for row in rows:
+        if not row.get("terminal_comp_valid", False) or not row.get("sample_valid", True):
+            continue
+        if config is not None:
+            selected = row.get("terminal_suffix_response_indices", [])
+            prompt_length = len(row["prompt_token_ids"])
+            shift = (
+                max(0, prompt_length + len(row["response_token_ids"]) - config.max_length)
+                if config.window_policy == "legacy_tail"
+                else 0
+            )
+            # Match collate's validity: losing any selected suffix position
+            # invalidates the entire terminal target in a legacy tail window.
+            if not selected or any(prompt_length + index < shift for index in selected):
+                continue
+        targets.append(float(row["terminal_comp_target"]))
+    if count != len(targets):
+        raise ValueError("Terminal metric count does not match evaluation rows")
+    mse = metrics["critic/terminal_raw_squared_error"] / count if count else None
+    zero_mse = sum(target * target for target in targets) / count if count else None
+    return {
+        "terminal_optimization_loss": metrics["critic/terminal_optimization_loss"],
+        "terminal_raw_mse": mse,
+        "terminal_raw_rmse": math.sqrt(mse) if mse is not None else None,
+        "terminal_zero_raw_mse": zero_mse,
+        "terminal_zero_raw_rmse": math.sqrt(zero_mse) if zero_mse is not None else None,
+        "terminal_mean_suffix_count": metrics["critic/terminal_suffix_count"] / count if count else None,
     }
 
 
@@ -288,6 +352,41 @@ def resolve_config(config_path, attention_implementation=None):
     return config
 
 
+def initialization_changes(meta, config, normalization, terminal_stats, tokenizer_sha256):
+    """Validate weight-only initialization without reinterpreting a TD head.
+
+    A local critic can seed the hybrid objective when its local target contract
+    and normalization are unchanged. This starts a new optimizer/data stream;
+    exact resume remains a separate operation.
+    """
+    source = ScalarConfig(**meta["config"])
+    expanded_objective = source.objective == "local_td0" and config.objective == "hybrid_terminal_composition"
+    for key in (
+        "model_path",
+        "value_layer",
+        "objective",
+        "loss_type",
+        "loss_mask",
+        "delta_label_mode",
+        "target_normalization",
+    ):
+        if getattr(source, key) != getattr(config, key) and not (key == "objective" and expanded_objective):
+            raise ValueError(f"Initialization semantic mismatch: {key}")
+    if (source.tokenizer_path or source.model_path) != (config.tokenizer_path or config.model_path):
+        raise ValueError("Initialization semantic mismatch: tokenizer_path")
+    if meta["tokenizer_sha256"] != tokenizer_sha256:
+        raise ValueError("Initialization tokenizer mismatch")
+    if expanded_objective and meta["normalization"] != normalization:
+        raise ValueError("TD-to-hybrid initialization requires identical TD normalization to preserve raw delta scale")
+    changes = ["Objective expanded from local_td0 to hybrid_terminal_composition"] if expanded_objective else []
+    for key, new in (("normalization", normalization), ("terminal_stats", terminal_stats)):
+        if meta[key] != new:
+            changes.append(f"{key} refitted on new train split")
+    if source.max_length != config.max_length or source.window_policy != config.window_policy:
+        changes.append("Training window changed from initialization checkpoint")
+    return changes
+
+
 def run(args):
     config = resolve_config(args.config, args.attention_implementation)
     from transformers import AutoConfig
@@ -313,6 +412,13 @@ def run(args):
     train_examples = [e for e in examples if split[e.rollout.rollout_id] == "train"]
     eval_examples = [e for e in examples if split[e.rollout.rollout_id] == "eval"]
     train_rows, eval_rows = ordinary_rows(train_examples, config), ordinary_rows(eval_examples, config)
+    td_row_count = len(train_rows)
+    td_rows_per_batch = getattr(args, "td_rows_per_batch", None)
+    if td_rows_per_batch is not None:
+        if config.objective != "hybrid_terminal_composition" or config.hybrid_reduction != "separate_samples":
+            raise ValueError("Fixed TD sampling requires hybrid separate_samples reduction")
+        if not 0 < td_rows_per_batch < args.global_batch:
+            raise ValueError("td_rows_per_batch must be positive and less than global_batch")
     hybrid_meta, terminal_stats = {"train": None, "eval": None}, None
     if config.objective == "hybrid_terminal_composition":
         if not args.continuations:
@@ -328,6 +434,8 @@ def run(args):
             raise ValueError("Evaluation continuation rows are incomplete")
         if not eval_hybrid:
             raise ValueError("Hybrid objective requires held-out continuation rows for terminal evaluation")
+        if not train_hybrid:
+            raise ValueError("Hybrid objective requires nonempty training continuation rows")
         terminal_stats = fit_stats(train_hybrid, terminal=True)
         train_rows += train_hybrid
         eval_rows += eval_hybrid
@@ -357,6 +465,7 @@ def run(args):
         "physical_microbatch": args.microbatch,
         "world_size": world,
         "seed": config.seed,
+        "td_rows_per_batch": td_rows_per_batch,
     }
     signature = fingerprint(
         {
@@ -366,6 +475,7 @@ def run(args):
             "max_steps": args.max_steps,
             "world_size": world,
             "microbatch": args.microbatch,
+            "td_rows_per_batch": td_rows_per_batch,
             "tokenizer": token_hash,
         }
     )
@@ -399,31 +509,10 @@ def run(args):
             provenance["initialization"] = meta["initialization"]
     elif initial:
         meta = read_artifact(initial)
-        for key in (
-            "model_path",
-            "tokenizer_path",
-            "value_layer",
-            "objective",
-            "loss_type",
-            "loss_mask",
-            "delta_label_mode",
-            "target_normalization",
-        ):
-            if meta["config"][key] != config.as_dict()[key]:
-                # tokenizer_path=None means model_path, so compare effective identities.
-                if key == "tokenizer_path" and (meta["config"][key] or meta["config"]["model_path"]) == (
-                    config.tokenizer_path or config.model_path
-                ):
-                    continue
-                raise ValueError(f"Initialization semantic mismatch: {key}")
-        if meta["tokenizer_sha256"] != token_hash:
-            raise ValueError("Initialization tokenizer mismatch")
+        provenance["semantics_changes"].extend(
+            initialization_changes(meta, config, normalization, terminal_stats, token_hash)
+        )
         provenance["initialization"] = {"weights_sha256": meta["weights_sha256"], "path": initial}
-        for key, new in (("normalization", normalization), ("terminal_stats", terminal_stats)):
-            if meta[key] != new:
-                provenance["semantics_changes"].append(f"{key} refitted on new train split")
-        if meta["config"]["max_length"] != config.max_length or meta["config"]["window_policy"] != config.window_policy:
-            provenance["semantics_changes"].append("Training window changed from initialization checkpoint")
     worker = build_worker(config, max_steps=args.max_steps, microbatch=args.microbatch, initial_artifact=initial)
     if args.resume:
         worker.load_checkpoint(str(Path(args.resume) / "engine"))
@@ -431,7 +520,12 @@ def run(args):
         train_rows
     ):
         raise ValueError("Resume row-order state does not match the current training data")
-    iterator = RowIterator(len(train_rows), config.seed, state["epoch"], state["cursor"])
+    if td_rows_per_batch is None:
+        iterator = RowIterator(len(train_rows), config.seed, state["epoch"], state["cursor"])
+    else:
+        iterator = HybridRowIterator(
+            td_row_count, len(train_rows) - td_row_count, config.seed, td_rows_per_batch, args.global_batch, state
+        )
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     end = min(args.max_steps, args.stop_after or args.max_steps)
@@ -449,6 +543,7 @@ def run(args):
             "train_loss": update_metrics["critic/total_loss"],
             "train_td_loss": update_metrics["critic/td_loss"],
             "train_terminal_loss": update_metrics["critic/terminal_loss"],
+            "train_terminal_optimization_loss": update_metrics["critic/terminal_optimization_loss"],
             "train_coverage": coverage_metrics(update_rows),
             "provenance": {
                 "signature": signature,
@@ -481,6 +576,9 @@ def main():
     parser.add_argument("--continuations")
     parser.add_argument("--global-batch", type=int, required=True)
     parser.add_argument("--max-steps", type=int, required=True)
+    parser.add_argument(
+        "--td-rows-per-batch", type=int, help="Fixed TD row count per hybrid update; remaining rows are terminal"
+    )
     parser.add_argument("--microbatch", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument(

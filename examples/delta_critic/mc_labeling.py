@@ -178,6 +178,8 @@ def label_mc_states(
             rewards.append(reward)
             empty += not continuation.token_ids
             if config.save_continuations:
+                if continuation.delta_top_logprobs is not None:
+                    validate_delta_top_logprobs(continuation.token_ids, continuation.delta_top_logprobs)
                 records.append(
                     {
                         "continuation_index": continuation_index,
@@ -256,6 +258,8 @@ async def label_mc_states_async(
                 rewards.append(reward)
                 empty += not continuation.token_ids
                 if config.save_continuations:
+                    if continuation.delta_top_logprobs is not None:
+                        validate_delta_top_logprobs(continuation.token_ids, continuation.delta_top_logprobs)
                     records.append(
                         {
                             "continuation_index": continuation_index,
@@ -382,3 +386,34 @@ def _assemble_labels(rollouts, states, config, links, values):
     # Step 1 validates state linkage, prefix alignment and all numeric outputs.
     adapt_legacy_rows(rollouts, labels)
     return labels
+
+
+def validate_delta_top_logprobs(token_ids, delta_top_logprobs, *, context="MC continuation"):
+    """Validate token-aligned top-probability rows before persisting them."""
+    if not isinstance(delta_top_logprobs, Sequence) or isinstance(delta_top_logprobs, str | bytes):
+        raise ValueError(f"{context} delta_top_logprobs must be a sequence of token candidate rows")
+    if len(delta_top_logprobs) != len(token_ids):
+        raise ValueError(
+            f"{context} delta_top_logprobs must align with token_ids: "
+            f"{len(delta_top_logprobs)} rows for {len(token_ids)} tokens"
+        )
+    for token_index, candidates in enumerate(delta_top_logprobs):
+        if not isinstance(candidates, Sequence) or isinstance(candidates, str | bytes) or not candidates:
+            raise ValueError(f"{context} delta_top_logprobs row {token_index} must contain candidate probabilities")
+        for rank, candidate in enumerate(candidates):
+            if not isinstance(candidate, Mapping) or "prob" not in candidate:
+                raise ValueError(
+                    f"{context} delta_top_logprobs candidate {rank} at token {token_index} must include prob"
+                )
+            try:
+                probability = float(candidate["prob"])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"{context} delta_top_logprobs candidate {rank} at token {token_index} has invalid prob"
+                ) from exc
+            if not isfinite(probability) or not 0.0 <= probability <= 1.0:
+                raise ValueError(
+                    f"{context} delta_top_logprobs candidate {rank} at token {token_index} "
+                    "prob must be finite and in [0, 1]"
+                )
+    return delta_top_logprobs
