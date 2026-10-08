@@ -106,6 +106,8 @@ DEFAULT_IGNORE_FILES = (
     # folding ``_multi_rs`` into a ROLLOUT_SERVER env-var toggle rather than
     # in this PR.
     "examples/rollout_correction/run_qwen2_5_7b_fsdp_multi_rs.sh",
+    # Multi-stage TD/Hybrid handoff coordinates multiple trainers, a critic, and evaluation.
+    "examples/delta_critic/run_td_hybrid_handoff.sh",
 )
 
 
