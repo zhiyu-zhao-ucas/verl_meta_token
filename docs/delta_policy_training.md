@@ -1,8 +1,29 @@
 # Delta policy 训练：实现状态与续作交接
 
-Last updated: 2026-10-02（短回答改用真实 reward 作 delta，并给标准化后的 delta 加上 clip）。
+Last updated: 2026-10-08（补充校准后的短回答 outcome advantage 与在线诊断说明）。
 
-## 2026-10-02 短回答用真实 reward 作 delta，标准化输出加 clip
+## 2026-10-02 短回答优势修正
+
+短回答现在使用独立校准的 outcome advantage：
+`A_outcome = (reward - baseline) / short_outcome_scale`。原回答使用
+`algorithm.delta_policy.short_outcome_baseline`（默认 0.5）；同一 prefix 的
+continuation 使用其他 sibling rewards 的 leave-one-out 均值，缺少 sibling
+时使用固定 baseline。`short_outcome_scale` 默认 0.5，因此固定 baseline
+下二元 reward 0/1 对应 -1/+1。
+
+这些行广播到全部 response token，并经过统一 advantage clip，但不再减去
+critic 的固定 mean、不参与 critic advantage 统计拟合。这样负的 critic
+mean 不会把错误短答的 reward=0 转成正优势。长回答继续使用原来的 local
+critic 预测及标准化。长度口径仍是原回答 response 长度、continuation
+prefix 加续写长度；短答规则本身没有改变。
+
+新的 outcome 合约及 baseline/scale 绑定到保存的统计 identity，拒绝直接
+恢复旧 raw-reward 混合标准化统计。若首批全部为 outcome 行，保存等待
+critic 统计的状态，直到首个含有效 critic 行的批次再拟合；不制造虚假
+mean/std。旧实验日志和 frozen source snapshot 仍反映下面记录的历史规则，
+正在运行的训练进程不会自动切换。
+
+## 历史规则：短回答用真实 reward 作 delta，标准化输出加 clip
 
 两个新开关都只作用于 `algorithm.delta_policy`，缺省不生效，因此不影响其它
 已运行实验和离线路径。
@@ -528,3 +549,76 @@ CUDA_VISIBLE_DEVICES=7 HF_HUB_OFFLINE=1 python -m examples.delta_critic.smoke_po
 显卡编号按实际空闲设备调整。`smoke_policy_training --two-gpu` 需要两张可见 GPU，额外比较单卡与两卡最终权重。两轮烟测验证每轮 actor 参数发生变化、下一轮配置使用上一轮导出的 actor、reference 文件哈希保持不变。它使用随机模型与玩具奖励，仅验证执行和数据契约，不衡量数学能力。
 
 中断阶段在启动前保存输入指纹；恢复时若数据或权重被改动会拒绝继续。训练阶段的优化器、学习率、数据游标及统计量恢复还需通过训练入口的 checkpoint 校验。
+
+## 评分和退化诊断（2026-10-03）
+
+比较历史实验时，应在同一套规则下重评两边保存的 validation 回答。
+训练 step N 的 rollout 来自更新前的 actor；validation step N 在第 N 次更新后执行。
+修改评分代码不会重训历史 checkpoint，也不会改变已启动任务的冻结 source。
+
+同步 reward manager 在线程池内调用评分函数。`sampling_io.score_text` 现在将
+线程中的 math-verify 计算转交给可复用的 spawn 子进程主线程，保留解析超时；
+进程执行失败向上传播，避免作为错误答案记零。原回答和 continuation 的
+MC 评分原本已在子进程中执行，因此历史验证线程漏判不能直接解释短答 actor
+优势。新评分入口和明确最终答案的配置见 `examples/delta_critic/README.md`。
+
+continuation 的 `rm_scores` 现在记录实际 `completion.reward`。历史 expansion
+日志把这 192 行记为零，因此 `critic/score/mean` 是 original 的奖励和除以 320，
+既不是 128 条 original 的准确率，也不是整个扩展 batch 的准确率。
+历史 MC labels 中的 continuation reward 仍然可用；短答使用独立的
+`delta_true_reward`，此次分数字段修正不会改变既有 delta 优势公式。
+
+`algorithm.delta_policy.kl_mask_scope` 默认仍为 `policy`；现在也支持显式
+设置 `response`，以覆盖首个选点前的 response token。两者始终使用固定初始
+reference。禁用的 continuation 与 padding 在两种 scope 下均不产生 KL 梯度。
+这是新增的可选优化范围，历史正常启动路径会拒绝 `response`。
+
+每步额外记录 `delta_policy/policy_token_coverage`，以及更新前的
+`preupdate_ref_kl_{response,policy,outside_policy}_row_mean` 和对应行数。
+这些是采样 token 上的 k3 估计，沿用 low-var KL 的截断；不能等同于完整词表
+KL 或将其接近零解释为生成质量恢复。`zero_reward_row_advantage_mean`、
+`zero_reward_positive_row_advantage_fraction` 及 positive-reward 对照项用于
+检查 frozen critic 是否仍在强化失败回答；有 `delta_true_reward` 时优先使用它。
+
+## O-TD / O-H 在线诊断（2026-10-04）
+
+同步训练现在直接把以下指标写入原有 metrics logger；不额外采样、不增加
+critic forward，也不改变 loss、advantage、优化器或数据划分。必须用新 source
+启动任务；已运行的 Ray worker 和历史 source 快照不会自动加载这些修改。
+
+| 指标前缀 | 用途 | 关键读法 |
+| --- | --- | --- |
+| `delta_policy/health/{all,original,continuation}/` | 分开看原始回答和续写的奖励、长度、选点、PG 覆盖率 | `reward_mean` 与 `response_length_mean` 同时下降时，先检查输出退化；不同训练 batch 的奖励不是固定验证集准确率 |
+| `delta_policy/health/{positive_reward,zero_reward}/` | 对照真实奖励与最终送入 actor 的 advantage | `positive_row_advantage_fraction`、`advantage_mean/std/max_abs` 揭示失败回答仍获正优势或信号失控；这是相关性，成功轨迹也可以包含负的局部 delta |
+| `delta_policy/health/{critic,short_outcome}/` | 区分 critic 信号与短答 outcome 替换 | `raw_delta_*` 按选点计数，`advantage_*` 按实际 PG token 计数；二者分母不同 |
+| `actor/delta_forward_*` | actor 当前 minibatch 相对本轮 old policy 的 ratio、clip 与 sampled KL | 单个 optimizer step 前 ratio 可以仍为 1；这些不是完整更新后的 policy 测量 |
+| `delta_mc/{all,train,diagnostic}/` | MC 数据是否还有可学习信号 | `all_zero_reward_state_fraction`、`mixed_reward_state_fraction`、`td_target_zero_fraction` 与 `branches`、`td_pairs` 一起看 |
+| `delta_critic/diagnostic_{prefit,postfit}/` | 同一批独立 critic 诊断数据上的预测质量 | TD 与 terminal 分别记录 RMSE、bias、相关性、非零标签符号正确率、零预测基线 |
+| `delta_critic/diagnostic_update/` | 一次 critic 更新本身的影响 | `*_rmse_change` 为 postfit − prefit，正值表示此次更新增大留出误差；`*_prediction_drift_rmse` 记录同批输出变化 |
+
+`diagnostic_{prefit,postfit}` 的 `td_zero_baseline_skill` 定义为
+`1 - mean((prediction - target)^2) / mean(target^2)`，小于零表示不如始终预测零。
+标签全零时该比值和非零符号正确率没有意义，必须检查相应 `*_valid`、
+`*_nonzero_target_count`、`*_target_zero_fraction`。相关性还要求预测和标签都有
+非零方差。所有空总体均有显式计数；零占位值不能当作健康信号。critic 更新窗口
+默认只有 8 个留出 TD pair，单窗方向正确率不能作稳定结论。
+
+MC 的 `branch_at_cap_fraction` 使用 max_tokens、有效 response 上限和有效总长度
+上限中的最小值，并给出 `branches_with_known_cap`；到达上限不等同于确认被截断。
+8 次采样全部失败也不证明真实成功概率为零。只有 full actor grid 中相邻的两个
+MC anchor 才贡献 `td_pairs`，未观测位置不会作为零标签计入。MC train/diagnostic
+分组遵循原有 prompt 角色，不影响训练隔离。
+
+Actor minibatch 指标沿用 loss 的真实行分母及 DP/SUM 聚合。每行先对 PG token
+取均值，再按 row weight 累积；没有 PG token 的行贡献零，需结合
+`delta_forward_active_pg_row_fraction` 解读。clip 指标分开报告 ratio 超出区间
+和按 advantage 符号真正触发 clipped objective 的比例。它们都使用 detach，
+不参与梯度。microbatch 内使用 SUM、DP 间补偿并平均，再由现有 trainer 对各次
+actor minibatch/epoch 的观测取均值；不能当作最后一次更新后的值。
+
+判断顺序：先看 MC 是否退化为全零、原始回答是否变短，再比较同批 critic
+prefit/postfit 的方向与零基线 skill，最后看真实奖励分组的 advantage 和 actor
+ratio/clip/KL。跨窗口的 critic RMSE 同时受到 policy、题目和标签分布变化影响，
+不能单独用来判断 critic 是否改善。进一步区分初始化 critic、online 更新和
+policy loss 的因果影响，仍需 matched frozen-critic 对照或固定数据上的 checkpoint
+重评分；新增日志提供定位证据，不自动给出因果结论。

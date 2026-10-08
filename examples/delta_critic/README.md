@@ -360,6 +360,71 @@ while the biased scalar head remains FP32. `local_td0` and
 statistics on training continuations alone and requires full eligible
 continuation coverage unless a continuation budget is explicitly configured.
 
+The 4B budgeted hybrid recipe uses `terminal_normalization: td`: terminal
+predictions are first restored with the TD mean/std, then the sum residual is
+divided by the TD std (or 1 when target normalization is disabled). Thus both
+objectives measure errors in the same delta units. The sum includes one TD mean
+offset per selected position; terminal predictions are summed, never averaged.
+`terminal_normalization: independent` retains the terminal target std used by
+older artifacts. Sharing the smaller TD std can substantially increase terminal
+loss and gradients, so `terminal_weight` controls its relative strength. Output
+units remain shared under either residual scale: both paths always restore each
+scalar with the TD mean/std before terminal composition.
+
+The corrected 4B recipes use `terminal_weight: 0.003` and
+`terminal_length_weighting: inverse_count`. The latter multiplies each terminal
+row's loss by `1 / K`, where `K` is its active suffix count; it never changes the
+predicted sum or its target. These are conservative starting weights, not a
+performance guarantee. `none` preserves legacy weighting. Held-out terminal
+raw MSE/RMSE is reported independently of the optimization weighting so changing
+the coefficient or length weights cannot masquerade as a better critic.
+
+`continuation_selection: uncertainty` uses the policy's `1 - top1_prob`
+ranking, greedy minimum gap and candidate budget. The continuation's first token
+is retained as the anchor boundary, within the total state budget; nearby
+uncertainty positions are excluded to maintain the minimum gap. This initial
+boundary is required by the unchanged `reward - v_prefix` target. The legacy
+`uniform` selector is still the default for old configs/artifacts. Uncertainty
+selection requires token-aligned `delta_top_logprobs` from the collection actor
+and fails if they are absent. New offline/online exports preserve those rows.
+
+Older continuation files can be enriched without changing their tokens/rewards:
+
+```bash
+uv run --no-project --python /path/to/training/python \
+  python -m examples.delta_critic.rescore_continuations \
+  --model Qwen/Qwen3-4B-Base --actor-version Qwen/Qwen3-4B-Base \
+  --labels /data/mc_labels_train.jsonl \
+  --continuations /data/continuations_train.jsonl \
+  --output /data/continuations_with_probs.jsonl --device cuda:0
+```
+
+Use the actual collection actor checkpoint/version; the tool loads cached Qwen3
+weights, teacher-forces stored sequences, chunks vocabulary logits and refuses
+to overwrite its destination. It reproduces the collector's default vLLM
+`raw_logprobs` before sampling temperature and top-p/top-k filtering.
+It does not sample new continuations or train.
+`config_train_hybrid_qwen3_4b_base.yaml` retains full native context and all stored
+branches; the `_2048` recipe is for shorter policy-expansion collections.
+To traverse the terminal training pool once, choose at least
+`ceil(N_terminal / (global_batch - td_rows_per_batch))` updates. The repeated TD
+epoch count alone does not describe terminal sample coverage.
+
+With `hybrid_reduction: separate_samples`, each distributed update minimizes
+`td_weight * mean_TD(L_TD) + terminal_weight * mean_terminal(w_K * L_terminal)`.
+Here `w_K = 1 / K` for `inverse_count`, and `1` for `none`;
+`L_terminal = 0.5 * ((sum_k(TD_std * z_k + TD_mean) - target) / residual_std)^2`.
+TD rows have a nonempty TD target mask; terminal rows have a valid terminal target.
+Padding contributes to neither count. Counts cover all ranks and accumulation
+microbatches, and evaluation uses the same reductions. A missing objective in an
+update contributes zero. The sampler still samples the combined dataset, so this
+does not ensure that every update contains both objectives. Use `--td-rows-per-batch`
+to draw a fixed number of original TD rows and fill the rest with terminal rows;
+the two independently shuffled streams persist their positions in checkpoints.
+The legacy default
+`all_samples` divides both sums by the total number of real rows. Old configs and
+artifacts default to `independent` and `all_samples`.
+
 New configs leave `max_length: null`; the trainer resolves it from the loaded
 backbone's native `max_position_embeddings` (Qwen3-8B: 40960). Inputs over the
 resolved cap are rejected.
@@ -404,12 +469,32 @@ torchrun --standalone --nproc_per_node=1 -m examples.delta_critic.train \
 For hybrid training, use `config_train_hybrid_qwen3_8b.yaml` and add
 `--continuations /data/continuations.jsonl`. A portable source `.pt` import or
 completed training artifact can be supplied with `--initialize` to load weights
-and start a fresh optimizer/data stream. Exact resume instead uses `--resume`
+and start a fresh optimizer/data stream. Initializing a hybrid run from a
+`local_td0` critic is supported when the local target contract and TD
+normalization are identical; changed mean/std is rejected to avoid reinterpreting
+the initialized head. The objective transition and initialization identity are
+recorded in the artifact. Exact resume instead uses `--resume`
 with a completed training checkpoint; it restores model, optimizer, scheduler,
 step, row-order cursor, and RNG state, and checks that data, statistics,
 configuration, effective batch, and DP topology match. Checkpoints include a
 portable scoring artifact plus V1 engine state. Evaluation reports TD and
 terminal losses, real/supervised row and token coverage, and data provenance.
+
+For the original 4B TD collection, the weight-only transition is explicit:
+
+```bash
+torchrun --standalone --nproc_per_node=4 -m examples.delta_critic.train \
+  --config examples/delta_critic/config_train_hybrid_qwen3_4b_base.yaml \
+  --rollouts /data/rollouts_train_regen.jsonl --labels /data/mc_labels_train.jsonl \
+  --split /data/split.json --continuations /data/continuations_with_probs.jsonl \
+  --initialize /runs/td/step_00000080 --output /runs/hybrid-corrected \
+  --global-batch 256 --td-rows-per-batch 128 --microbatch 1 \
+  --max-steps 1000 --save-every 20
+```
+
+Keep the initialized TD artifact's exact TD data and split for this transition.
+Choose the update budget from the actual terminal pool; the example does not
+start a job or select devices for an existing run.
 
 The small acceptance harness exercises a real tiny Qwen3 through the V1 worker,
 including save/resume next-step equivalence, microbatch/DP scaling, and
@@ -457,6 +542,42 @@ either eval path — so for a checkpoint trained with `paired_next_state` this i
 a *different quantity* from the training target, and only `selected_segment`
 models are evaluated against the target they were trained on.
 
+## Consistent math rewards for policy and MC
+
+Use `examples/delta_critic/reward.py:compute_score` for new policy runs. The
+trainer wrapper and MC scorer both retain the existing extraction rule by
+default. To require an explicit final answer, enable it in both places:
+
+```yaml
+reward:
+  custom_reward_function:
+    path: examples/delta_critic/reward.py
+    name: compute_score
+    reward_kwargs:
+      math_verify_require_final_answer: true
+algorithm:
+  delta_policy:
+    mc:
+      reward:
+        method: math_verify
+        fallback_on_import_error: false
+        math_verify_require_final_answer: true
+```
+
+With this option, scoring requires the latest explicit `\boxed{...}` or anchored
+`Answer:` / `Final answer:` field. Fields may put their answer on the next line
+or in a following LaTeX math block. An empty or malformed last field scores
+zero; arbitrary numbers in unfinished reasoning are not final answers. The
+wrapper and `score_text` helper both default this flag to `false`, so set it
+explicitly for offline collection as well when adopting this stricter rule.
+
+Threaded reward calls and async MC use the same spawned CPU scorer, preserving
+Math-Verify's signal timeouts. Bare gold expressions are parsed as complete math
+expressions, and fast numeric comparisons require complete decimal literals
+(with the existing absolute tolerance of `1e-6`). Regrade saved responses and
+MC labels consistently when adopting this rule; changing source does not
+repair rewards or model updates from a running or historical experiment.
+
 ## Source references and verification
 
 Paths below are relative to the `value_model` checkout, under
@@ -487,3 +608,72 @@ module and selects the critic dataset/statistics definitions from its AST to
 avoid importing the training stack. It checks both label modes, both supervision
 masks, learned/oracle propagation, and both statistics populations. Without the
 variable, only this external-source comparison is skipped.
+
+## Value regression and a matched delta control
+
+```bash
+bash examples/delta_critic/run_qwen3_4b_value_policy_fsdp2.sh \
+  --work-dir "$PWD/outputs/value_difference_80step" --gpus 0 1 2 3
+```
+
+This starts a detached, sequential pipeline: value training (80 optimizer
+steps, validation every 5) → policy training (10 steps) → matched direct-delta
+training → matched policy training. It uses the existing compatible Python
+environment via `uv`; override `PYTHON_BIN` if needed. No continuous monitoring
+is required. Each failed stage stops the pipeline and records a nonzero exit
+code. An existing output directory is never overwritten. `prepare` only
+freezes and checks inputs; `run --work-dir ...` runs a prepared experiment in
+the foreground. The same GPU leases are held for the complete sequence.
+
+Inputs must match the actual TD80 fingerprints: the P95-filtered collection
+with 438 train / 48 heldout trajectories. No MC labels are regenerated or
+rescored. Both arms use the identical sealed October 6 TD sources, Qwen3-4B-Base
+weights, fresh FP32 scalar head, seed42, deterministic row iterator, DP4,
+global batch128, microbatch16, AdamW LR1e-5, clipping1, zero weight decay,
+linear decay over 80 steps, raw per-row MSE, and supervision boundaries. The
+pipeline compares the actual initial parameter bytes and optimizer batch
+schedule between arms. Only the regression target and its prescribed inference
+mapping differ. Each arm retains just its best **heldout point-weighted raw
+MSE** checkpoint under `critic_{arm}/best`; ties keep the earliest step.
+
+For response tokens `y[0:n]`, boundary `i` means the state
+`prompt + y[:i]`, before generating `y[i]`. Its target is the stored
+`v_prefix`, the mean final reward of the collector's MC continuations from
+that prefix. A causal scalar head therefore reads sequence position
+`prompt_length + i - 1`; boundary0 reads the prompt's last token. Boundary
+`n` represents the stopped/capped full answer and has the stored final reward
+as its value label. It is **not** an absorbing state after reward payment.
+Unsampled intermediate values have no training labels.
+
+At selected boundaries `i[k]`, the original selected-segment label is
+`V(i[k+1]) - V(i[k])`, with `V(n) = terminal_reward` for the final segment.
+The value model predicts each boundary value and subtracts its predictions,
+including its **predicted** `V(n)` for the tail. This is not the paired-next-token
+label `V(i+1)-V(i)` unless those happen to be adjacent selected boundaries.
+The matched direct-delta arm fits those same differences directly at the
+same pre-token positions. Both arms supervise the terminal boundary, with
+value target `terminal_reward` and direct-delta target0 (no following segment).
+
+These matched controls are not a target-only comparison against the old
+TD80 artifact: historical TD80 reads position `prompt_length+i`, uses
+response-wide zero background targets, balanced MSE, and delta standardization.
+Applying that mask to prefix values would fabricate labels. The common changes
+are recorded in `alignment.json`. Value differencing also reads the later
+prefix, whereas a single direct-delta output uses only the current prefix;
+equal information at each scalar readout cannot be claimed. Policy settings
+otherwise match the repaired historical TD recipe, including horizon100,
+loop stop10, the expansion budget, and the <=100-token realized-reward override
+in both arms. Consequently, short-answer overrides are shared exceptions to
+the critic's prediction rule. GPU sampling may diverge even with identical
+seeds, and later policy trajectories need not match.
+
+Inspect `status.json`, `alignment.json`, `critic_{arm}/selection.json`, stage
+logs, and `policy_{arm}/td/metrics.jsonl` after completion. `exit_code=0` means
+all four stages completed; failure details go to `status.json`. Source and
+input hashes are checked before every training stage. The driver additionally
+checks the source loaded by Ray and the ordered policy prompt schedule.
+
+```bash
+uv run --offline --no-project --python "$PYTHON_BIN" python -m pytest -q \
+  tests/special_standalone/delta_critic/test_value_difference.py
+```
