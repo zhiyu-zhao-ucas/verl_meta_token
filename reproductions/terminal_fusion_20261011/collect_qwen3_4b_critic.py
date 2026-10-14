@@ -20,11 +20,13 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import tarfile
+from dataclasses import replace
 from pathlib import Path
 
 import yaml
@@ -168,6 +170,33 @@ def check_gpus(ids: list[str]) -> None:
         raise RuntimeError(f"Selected GPUs are occupied: {used}")
 
 
+def finite_mc_diagnostics(continuations):
+    """Discard impossible zero-probability top-k entries, preserving every sampled token."""
+    cleaned = []
+    masked = 0
+    for continuation in continuations:
+        if continuation.delta_top_logprobs is None:
+            cleaned.append(continuation)
+            continue
+        rows = []
+        for candidates in continuation.delta_top_logprobs:
+            valid = []
+            for candidate in candidates:
+                probability = float(candidate["prob"])
+                logprob = float(candidate["logprob"])
+                if math.isfinite(probability) and math.isfinite(logprob):
+                    valid.append(candidate)
+                elif probability == 0.0 and logprob == float("-inf"):
+                    masked += 1
+                else:
+                    raise ValueError("Nonfinite MC top-k diagnostic has nonzero probability")
+            if not valid:
+                raise ValueError("MC token has no finite top-k diagnostic candidate")
+            rows.append(valid)
+        cleaned.append(replace(continuation, delta_top_logprobs=rows))
+    return cleaned, masked
+
+
 def run(args) -> None:
     root = args.output.resolve(strict=True)
     plan = read(root / "collection_plan.json")
@@ -196,6 +225,28 @@ def run(args) -> None:
     sys.path.insert(0, str(source))
     os.chdir(source)
     from examples.delta_critic import batch_sample
+
+    original_sample = batch_sample.sample_v1_continuations
+
+    async def sample_with_finite_diagnostics(*sample_args, **sample_kwargs):
+        continuations = await original_sample(*sample_args, **sample_kwargs)
+        cleaned, masked = finite_mc_diagnostics(continuations)
+        if masked:
+            request = sample_args[0]
+            with (root / "collection/masked_toplogprob_counts.jsonl").open("a") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "rollout_id": request.rollout_id,
+                            "prefix_tokens": len(request.prefix_response_token_ids),
+                            "masked_zero_probability_candidates": masked,
+                        }
+                    )
+                    + "\n"
+                )
+        return cleaned
+
+    batch_sample.sample_v1_continuations = sample_with_finite_diagnostics
 
     loader = importlib.util.spec_from_file_location("frozen_online_collect", root / "assets/online_collect.py")
     if loader is None or loader.loader is None:

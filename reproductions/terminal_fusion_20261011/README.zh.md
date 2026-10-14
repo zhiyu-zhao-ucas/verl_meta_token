@@ -142,3 +142,5 @@ export COLLECT_DIR="$PWD/outputs/qwen3_4b_initial_critic_512_001"
 ```
 
 输出在 `$COLLECT_DIR/collection/`，配置和模型、tokenizer、题目、代码包身份在 `collection_plan.json`。只使用当前机器空闲的物理 GPU；运行入口会在启动前拒绝显存已占用超过 512 MiB 的卡。采集中断时保持同一目录并重新执行 `run`，原采样器会校验配置并恢复未完成的临时输出。该 Qwen3-4B tokenizer 的指纹与 Base 不同；后续如果用这些数据训练 critic，critic 与 policy 的模型和 tokenizer 身份也必须相应改为 Qwen3-4B，不能直接放入上面基于 Base 的 C/D policy 配置。
+
+Qwen3-4B 的 MC top-k 诊断有时包含概率为零、logprob 为 `-inf` 的候选。采样请求和所有采样参数保持原样；写盘前仅删除这些不可能被采中的诊断候选，保留生成 token、奖励和其余有限候选。删除数量记录在 `collection/masked_toplogprob_counts.jsonl`；若出现非零概率的非有限值则直接报错。
