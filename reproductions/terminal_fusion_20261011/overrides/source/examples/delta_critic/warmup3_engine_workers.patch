@@ -1,0 +1,48 @@
+--- baseline/verl/workers/engine_workers.py
++++ warmup3/verl/workers/engine_workers.py
+@@ -353,7 +353,11 @@
+                 tu.assign_non_tensor(
+                     mini_batch_td,
+                     global_token_num=NonTensorData(global_token_num),
+-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
++                    # Warmup experiment: count optimizer updates rather than rollout batches.
++                    update_lr_scheduler=(
++                        self.optimizer_config.lr_warmup_steps == 3
++                        or batch_idx == total_num_iterations - 1
++                    ),
+                     disable_auto_offload=True,
+                 )
+                 # Name the mini-batch in the trace so each iteration of this otherwise identical
+@@ -413,6 +417,12 @@
+             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+             Timer(name="train_batch", logger=None) as timer,
+         ):
++            warmup_trace = None
++            if self.optimizer_config.lr_warmup_steps == 3:
++                warmup_trace = {
++                    "optimizer_update": self.engine.lr_scheduler.last_epoch + 1,
++                    "lr_used": float(self.engine.optimizer.param_groups[0]["lr"]),
++                }
+             output = self.engine.train_batch(data, loss_function=self.loss_fn)
+             # containing loss, model_output and metrics
+             # for training, we only care about loss and metrics
+@@ -424,6 +434,19 @@
+             lr = self.engine.lr_scheduler_step()
+         else:
+             lr = None
++
++        if warmup_trace is not None:
++            import json
++            from pathlib import Path
++
++            warmup_trace.update(
++                lr_after_update=float(self.engine.optimizer.param_groups[0]["lr"]),
++                scheduler_advanced=bool(update_lr_scheduler),
++            )
++            trace_dir = Path(os.environ["VERL_WARMUP_LR_TRACE_DIR"])
++            rank = self.engine.get_data_parallel_rank()
++            with (trace_dir / f"rank_{rank}.jsonl").open("a") as trace_stream:
++                trace_stream.write(json.dumps(warmup_trace) + "\n")
+ 
+         if self.engine.is_mp_src_rank_with_outputs():
+             # we don't need model_output in training. Maybe we change out mind later
