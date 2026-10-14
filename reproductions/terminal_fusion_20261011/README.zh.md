@@ -125,3 +125,20 @@ cat "$TF_RUN_DIR/evaluation/D_run_1_step_10/results.csv"
 | C/D actor checkpoint、rollouts、优势统计、评测输出 | 接收者机器新生成 | 不传原产物 |
 
 历史数值比较应同时记录 Base revision、训练数据 SHA、critic 新 SHA、四份生成配置 SHA、源码 manifest、GPU/包版本、随机种子、训练日志与评测结果。新 critic 的采样和 GPU 运算可造成数值差异，因此在报告中标明 `rebuilt critic`。
+
+## 可选：用 Qwen3-4B 重新采集初始 critic 数据
+
+此项是单独的数据采集实验。模型固定为公开的 `Qwen/Qwen3-4B` revision `1cfa9a7208912126459214e8b04321603b3df60c`，**不是** `Qwen/Qwen3-4B-Base`。采集使用上文同一份 512 题封存输入。`collect_qwen3_4b_critic.py prepare` 会逐条检查这 512 题在 Qwen3-4B tokenizer 下的 token ID，并验证正式配置与初始 critic 采集的有效配置相比只有 `model.actor_model` 变化。temperature 1.0、top_p 0.95、top_k 20、原回答及 MC 最多 30720 token、每回答最多 64 个 state、每 state 16 个 MC 分支、seed 42 均保持一致。每卡 rollout/MC 并发分别为 8/128；GPU 张数可以不同。
+
+```bash
+# 先通过 Hugging Face 下载固定 revision，并把 MODEL 指向下载好的 snapshot。
+export MODEL=/path/to/Qwen3-4B/snapshot
+export COLLECT_DIR="$PWD/outputs/qwen3_4b_initial_critic_512_001"
+"$PYTHON_BIN" reproductions/terminal_fusion_20261011/collect_qwen3_4b_critic.py prepare \
+  --output "$COLLECT_DIR" --model "$MODEL" \
+  --archive "$PWD/examples/delta_critic/handoff_assets.tgz" --gpus 0,1,2,5,6,7
+"$PYTHON_BIN" reproductions/terminal_fusion_20261011/collect_qwen3_4b_critic.py run \
+  --output "$COLLECT_DIR"
+```
+
+输出在 `$COLLECT_DIR/collection/`，配置和模型、tokenizer、题目、代码包身份在 `collection_plan.json`。只使用当前机器空闲的物理 GPU；运行入口会在启动前拒绝显存已占用超过 512 MiB 的卡。采集中断时保持同一目录并重新执行 `run`，原采样器会校验配置并恢复未完成的临时输出。该 Qwen3-4B tokenizer 的指纹与 Base 不同；后续如果用这些数据训练 critic，critic 与 policy 的模型和 tokenizer 身份也必须相应改为 Qwen3-4B，不能直接放入上面基于 Base 的 C/D policy 配置。
