@@ -767,6 +767,8 @@ class vLLMHttpServer:
                 candidates = []
                 for token_id, entry in top.items():
                     value = float(entry.logprob)
+                    if not math.isfinite(value):
+                        continue
                     candidates.append(
                         {
                             "token_id": int(token_id),
