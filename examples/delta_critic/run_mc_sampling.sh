@@ -81,7 +81,26 @@ run_split() {
         (( cnt <= 0 )) && continue
         local dir=$OUT_DIR/$name/shard_$i
         mkdir -p "$dir"
-        make_config "$split" "$off" "$cnt" "$dir/config.yaml"
+        local expected_config=$dir/config.expected.yaml
+        make_config "$split" "$off" "$cnt" "$expected_config"
+        if [[ -f $dir/config.yaml ]]; then
+            if ! cmp -s "$expected_config" "$dir/config.yaml"; then
+                rm -f "$expected_config"
+                echo "[$name] shard $i config differs from existing run" >&2
+                exit 1
+            fi
+            rm -f "$expected_config"
+        else
+            mv "$expected_config" "$dir/config.yaml"
+        fi
+        if [[ -f $dir/data/rollouts_${split}_regen.jsonl &&
+              -f $dir/data/states_${split}.jsonl &&
+              -f $dir/data/mc_labels_${split}.jsonl &&
+              ( -f $dir/data/continuations_${split}.jsonl ||
+                -f $dir/data/continuations_${split}.parquet ) ]]; then
+            echo "[$name] shard $i already complete; skipping"
+            continue
+        fi
         (
             CUDA_VISIBLE_DEVICES=${GPU_LIST[$i]} python -m examples.delta_critic.batch_sample \
                 --config "$dir/config.yaml" \
