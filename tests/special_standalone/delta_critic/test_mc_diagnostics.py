@@ -9,11 +9,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from copy import deepcopy
 
 import pytest
 
-from examples.delta_critic.mc_diagnostics import mc_batch_diagnostics
+from examples.delta_critic.mc_diagnostics import (
+    impossible_near_end_labels,
+    mc_batch_diagnostics,
+    mc_endpoint_calibration,
+)
 
 
 def record(role, rewards):
@@ -78,3 +83,58 @@ def test_rejects_nonfinite_rewards():
     row["rollout"]["terminal_reward"] = float("nan")
     with pytest.raises(ValueError, match="finite"):
         mc_batch_diagnostics([row])
+
+
+def test_endpoint_calibration_uses_every_rollout_without_outcome_filtering():
+    records = []
+    for index, reward in enumerate((1.0, 0.0)):
+        records.append(
+            {
+                "rollout": {"id": f"r{index}", "terminal_reward": reward},
+                "labels": [
+                    {"token_index": 0, "v_prefix": 0.75 if reward else 0.25},
+                    {"token_index": 9, "v_prefix": 0.5},
+                ],
+            }
+        )
+    result = mc_endpoint_calibration(records)
+    assert result["population"] == 2
+    assert result["first"]["mean_gap"] == 0
+    assert result["last"]["mean_gap"] == 0
+    assert result["passed"]
+
+    biased = [
+        {
+            "rollout": {"id": f"bad{index}", "terminal_reward": 1.0},
+            "labels": [{"token_index": 0, "v_prefix": 0.0}, {"token_index": 9, "v_prefix": 0.0}],
+        }
+        for index in range(10)
+    ]
+    assert not mc_endpoint_calibration(biased)["passed"]
+
+
+def test_impossible_label_check_uses_correct_near_end_suffix_as_lower_bound():
+    label = {
+        "state_id": "r:t1",
+        "token_index": 1,
+        "prefix_response_token_ids": [10],
+        "prefix_continuation_rewards": [0.0] * 16,
+    }
+    records = [
+        {
+            "rollout": {
+                "id": "r",
+                "terminal_reward": 1.0,
+                "response_token_ids": [10, 11],
+                "behavior_logprobs": [math.log(0.8), math.log(0.9)],
+            },
+            "labels": [label],
+        }
+    ]
+    result = impossible_near_end_labels(records)
+    assert result["tested_states"] == 1
+    assert not result["passed"]
+    assert result["violations"][0]["known_suffix_probability"] == pytest.approx(0.9)
+
+    label["prefix_continuation_rewards"] = [1.0] * 16
+    assert impossible_near_end_labels(records)["passed"]

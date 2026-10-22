@@ -17,6 +17,129 @@ def _mean(values):
     return sum(values) / len(values) if values else 0.0
 
 
+def _standard_error(values):
+    if len(values) < 2:
+        return 0.0
+    mean = _mean(values)
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    return math.sqrt(variance / len(values))
+
+
+def mc_endpoint_calibration(records, *, z_limit=3.0):
+    """Calibrate first/last-state MC values against realized outcomes.
+
+    Every rollout contributes once to each endpoint. The population is never
+    filtered by correctness, so the gap ``R - p`` remains an unbiased
+    calibration diagnostic. ``z_limit=3`` is deliberately sampling-aware;
+    unlike a fixed +/-0.2 log-ratio gate, it can pass with the available data.
+    """
+    if not math.isfinite(z_limit) or z_limit <= 0:
+        raise ValueError("z_limit must be positive and finite")
+    endpoint_gaps = {"first": [], "last": []}
+    endpoint_rewards = {"first": [], "last": []}
+    endpoint_values = {"first": [], "last": []}
+    for record in records:
+        rollout = record["rollout"]
+        labels = sorted(record.get("labels", []), key=lambda label: int(label["token_index"]))
+        if not labels:
+            raise ValueError(f"Rollout {rollout.get('id')} has no MC labels for endpoint calibration")
+        reward = float(rollout["terminal_reward"])
+        if not math.isfinite(reward):
+            raise ValueError("Endpoint calibration requires finite terminal rewards")
+        for name, label in (("first", labels[0]), ("last", labels[-1])):
+            value = float(label["v_prefix"])
+            if not math.isfinite(value):
+                raise ValueError("Endpoint calibration requires finite MC values")
+            endpoint_rewards[name].append(reward)
+            endpoint_values[name].append(value)
+            endpoint_gaps[name].append(reward - value)
+    result = {"population": len(endpoint_gaps["first"]), "z_limit": float(z_limit)}
+    for name in ("first", "last"):
+        gaps = endpoint_gaps[name]
+        gap = _mean(gaps)
+        standard_error = _standard_error(gaps)
+        threshold = z_limit * standard_error
+        result[name] = {
+            "count": len(gaps),
+            "realized_success_mean": _mean(endpoint_rewards[name]),
+            "mc_success_mean": _mean(endpoint_values[name]),
+            "mean_gap": gap,
+            "standard_error": standard_error,
+            "z_score": gap / standard_error if standard_error else (0.0 if gap == 0 else math.inf),
+            "threshold": threshold,
+            "passed": abs(gap) <= threshold,
+        }
+    result["passed"] = all(result[name]["passed"] for name in ("first", "last"))
+    return result
+
+
+def impossible_near_end_labels(records, *, remaining_token_limit=10, probability_limit=0.001):
+    """Find MC counts incompatible with a known correct sampled suffix.
+
+    This intentionally examines only correct, near-end responses. That
+    outcome-conditioned subset is valid for the per-state probability bound,
+    but must never be reused for endpoint calibration.
+    """
+    if remaining_token_limit < 1:
+        raise ValueError("remaining_token_limit must be positive")
+    if not 0 < probability_limit < 1:
+        raise ValueError("probability_limit must be in (0, 1)")
+    tested = 0
+    violations = []
+    for record in records:
+        rollout = record["rollout"]
+        if float(rollout.get("terminal_reward", 0.0)) <= 0:
+            continue
+        response_ids = rollout.get("response_token_ids")
+        behavior_logprobs = rollout.get("behavior_logprobs")
+        if response_ids is None or behavior_logprobs is None or len(response_ids) != len(behavior_logprobs):
+            raise ValueError("Impossible-label test requires token-aligned response IDs and behavior log-probabilities")
+        for label in record.get("labels", []):
+            prefix_length = len(label.get("prefix_response_token_ids", []))
+            remaining = len(response_ids) - prefix_length
+            if not 1 <= remaining <= remaining_token_limit:
+                continue
+            suffix_logprobs = [float(value) for value in behavior_logprobs[prefix_length:]]
+            if not all(math.isfinite(value) and value <= 0 for value in suffix_logprobs):
+                raise ValueError("Impossible-label test requires finite, nonpositive behavior log-probabilities")
+            lower_bound = math.exp(sum(suffix_logprobs))
+            rewards = label.get("prefix_continuation_rewards")
+            if rewards is None:
+                rewards = [
+                    continuation["reward"]
+                    for continuation in label.get("mc_continuations", [])
+                    if continuation.get("reward") is not None
+                ]
+            rewards = [float(reward) for reward in rewards]
+            if not rewards:
+                raise ValueError("Impossible-label test requires saved individual MC rewards")
+            successes = sum(reward > 0 for reward in rewards)
+            sample_count = len(rewards)
+            tail_probability = sum(
+                math.comb(sample_count, index) * lower_bound**index * (1 - lower_bound) ** (sample_count - index)
+                for index in range(successes + 1)
+            )
+            tested += 1
+            if tail_probability < probability_limit:
+                violations.append(
+                    {
+                        "rollout_id": rollout.get("id"),
+                        "state_id": label.get("state_id"),
+                        "remaining_tokens": remaining,
+                        "successes": successes,
+                        "samples": sample_count,
+                        "known_suffix_probability": lower_bound,
+                        "binomial_lower_tail_probability": tail_probability,
+                    }
+                )
+    return {
+        "tested_states": tested,
+        "probability_limit": probability_limit,
+        "violations": violations,
+        "passed": not violations,
+    }
+
+
 def _summary(records):
     original_rewards, rewards, lengths, cap_hits, values, targets, gaps = [], [], [], [], [], [], []
     branch_counts, mixed, all_zero, all_positive, binary = [], [], [], [], []
