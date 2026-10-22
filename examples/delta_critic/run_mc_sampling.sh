@@ -34,6 +34,8 @@ GPUS=${GPUS:-0}                         # one GPU = one TP1 replica; see "Scalin
 ROLLOUT_CONCURRENCY=${ROLLOUT_CONCURRENCY:-64}  # concurrent rollouts
 MC_CONCURRENCY=${MC_CONCURRENCY:-128}   # concurrent MC sequences in flight
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.9}
+RUN_TRAIN=${RUN_TRAIN:-1}               # 1 to collect train, 0 to skip it
+RUN_EVAL=${RUN_EVAL:-1}                 # 1 to collect held-out rank_eval, 0 to skip it
 # ==========================================================================
 # Scaling: each batch_sample process drives ONE vLLM replica on one GPU
 # (tensor_parallel_size=1 in the config). To use K GPUs, this script launches K
@@ -69,6 +71,17 @@ yaml.safe_dump(cfg, open(out, "w"), sort_keys=False)
 PY
 }
 export N_TRAIN MODEL MAX_MODEL_LEN MAX_NEW_TOKENS MC_PER_STATE STATES_PER_RESPONSE
+
+for enabled in "$RUN_TRAIN" "$RUN_EVAL"; do
+    [[ $enabled == 0 || $enabled == 1 ]] || {
+        echo "RUN_TRAIN and RUN_EVAL must be 0 or 1" >&2
+        exit 2
+    }
+done
+(( RUN_TRAIN == 1 || RUN_EVAL == 1 )) || {
+    echo "At least one of RUN_TRAIN or RUN_EVAL must be enabled" >&2
+    exit 2
+}
 
 # run_split <name: train|eval> <batch_sample split: train|rank_eval> <start> <total>
 run_split() {
@@ -123,8 +136,8 @@ run_split() {
 
 # Train questions are [0, N_TRAIN); eval questions are [N_TRAIN, N_TRAIN+N_EVAL)
 # of the same dataset (no overlap). Both read the dataset's train split.
-run_split train train     0        "$N_TRAIN"
-run_split eval  rank_eval "$N_TRAIN" "$N_EVAL"
+(( RUN_TRAIN == 0 )) || run_split train train     0         "$N_TRAIN"
+(( RUN_EVAL == 0 ))  || run_split eval  rank_eval "$N_TRAIN" "$N_EVAL"
 
 echo "Done. Outputs under $OUT_DIR"
 echo "  train: $OUT_DIR/train/shard_*/data/{rollouts_train_regen,states_train,mc_labels_train,continuations_train}.jsonl"
