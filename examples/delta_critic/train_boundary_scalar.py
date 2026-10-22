@@ -115,6 +115,10 @@ def run(args):
     torch.manual_seed(config.seed)
     random.seed(config.seed)
     np.random.seed(config.seed)
+    data_fingerprints = {key: file_hash(getattr(args, key)) for key in ("rollouts", "labels", "split")}
+    from .data_fingerprints import reject_denied_data_fingerprints
+
+    reject_denied_data_fingerprints(data_fingerprints)
     examples, diagnostics = adapt_legacy_rows(read_rows(args.rollouts), read_rows(args.labels))
     split = json.loads(Path(args.split).read_text())
     if set(split) != {e.rollout.rollout_id for e in examples} or set(split.values()) != {"train", "eval"}:
@@ -134,7 +138,7 @@ def run(args):
         "config": config.as_dict(),
         "initial_parameter_sha256": identity,
         "tokenizer_sha256": tokenizer_hash,
-        "data_fingerprints": {key: file_hash(getattr(args, key)) for key in ("rollouts", "labels", "split")},
+        "data_fingerprints": data_fingerprints,
         "global_batch": args.global_batch,
         "microbatch": args.microbatch,
         "world_size": world,

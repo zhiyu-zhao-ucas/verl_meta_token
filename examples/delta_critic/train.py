@@ -404,6 +404,14 @@ def run(args):
     torch.manual_seed(config.seed)
     random.seed(config.seed)
     np.random.seed(config.seed)
+    files = {
+        key: file_hash(getattr(args, key))
+        for key in ("rollouts", "labels", "split", "continuations")
+        if getattr(args, key)
+    }
+    from .data_fingerprints import reject_denied_data_fingerprints
+
+    reject_denied_data_fingerprints(files)
     rollouts, labels = read_rows(args.rollouts), read_rows(args.labels)
     examples, diagnostics = adapt_legacy_rows(rollouts, labels)
     split = json.loads(Path(args.split).read_text())
@@ -447,11 +455,6 @@ def run(args):
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     if pad is None:
         raise ValueError("Tokenizer requires pad or eos token")
-    files = {
-        key: file_hash(getattr(args, key))
-        for key in ("rollouts", "labels", "split", "continuations")
-        if getattr(args, key)
-    }
     provenance = {
         "tokenizer_sha256": token_hash,
         "data_fingerprints": files,

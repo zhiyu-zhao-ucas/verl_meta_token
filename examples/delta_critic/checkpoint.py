@@ -21,6 +21,7 @@ from pathlib import Path
 
 import torch
 
+from .data_fingerprints import reject_denied_data_fingerprints
 from .training_config import ScalarConfig
 
 FORMAT_VERSION = 1
@@ -168,7 +169,7 @@ def write_artifact(directory, state, config, normalization, terminal_stats=None,
     return metadata
 
 
-def read_artifact(directory):
+def read_artifact(directory, *, allow_denied_data_for_audit=False):
     directory = Path(directory)
     try:
         meta = json.loads((directory / "metadata.json").read_text())
@@ -176,6 +177,7 @@ def read_artifact(directory):
         raise ValueError(f"Cannot read portable critic metadata from {directory}") from exc
     if not isinstance(meta, dict) or meta.get("format_version") != FORMAT_VERSION:
         raise ValueError("Unsupported scalar artifact version")
+    reject_denied_data_fingerprints(meta.get("data_fingerprints"), allow_for_audit=allow_denied_data_for_audit)
     try:
         config = ScalarConfig(**meta["config"])
     except (KeyError, TypeError) as exc:

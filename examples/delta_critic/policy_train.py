@@ -507,6 +507,10 @@ def run(args):
         raise ValueError(f"Policy max_length={loss_config.max_length} exceeds model context={native_length}")
     effective_max_length = loss_config.max_length or native_length
 
+    files = {name: file_hash(getattr(args, name)) for name in ("rollouts", "labels", "split")}
+    from .data_fingerprints import reject_denied_data_fingerprints
+
+    reject_denied_data_fingerprints(files)
     rollouts, labels = read_rows(args.rollouts), read_rows(args.labels)
     examples, diagnostics = adapt_legacy_rows(rollouts, labels)
     split = json.loads(Path(args.split).read_text())
@@ -525,7 +529,6 @@ def run(args):
         raise ValueError("Tokenizer requires pad or eos token")
     actor_fingerprint = _path_fingerprint(training_config.model_path)
 
-    files = {name: file_hash(getattr(args, name)) for name in ("rollouts", "labels", "split")}
     raw_predictions = None
     critic_fingerprint = None
     if loss_config.advantage_source == "critic":
