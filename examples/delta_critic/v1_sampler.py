@@ -68,12 +68,21 @@ async def sample_v1_continuations(
             rows = (output.extra_fields or {}).get("delta_mc_token_ids")
             if not isinstance(rows, list) or len(rows) != count:
                 raise ValueError("V1 backend must return every delta_mc_n continuation")
+            logprob_rows = (output.extra_fields or {}).get("delta_mc_sampled_logprobs")
+            if config.sampling_config.get("logprobs"):
+                if not isinstance(logprob_rows, list) or len(logprob_rows) != count:
+                    raise ValueError(
+                        "V1 backend must return sampled log-probabilities for every delta_mc_n continuation"
+                    )
+            else:
+                logprob_rows = [None] * count
             return [
                 MCContinuation(
                     checked_tokens(token_ids),
                     tokenizer.decode(token_ids, skip_special_tokens=config.continuation_skip_special_tokens),
+                    sampled_logprobs=None if sampled is None else tuple(sampled),
                 )
-                for token_ids in rows
+                for token_ids, sampled in zip(rows, logprob_rows, strict=True)
             ]
 
         # Keep one request per state in flight. The shared semaphore can then
@@ -105,10 +114,15 @@ async def sample_v1_continuations(
                     candidates = (output.extra_fields or {}).get("delta_top_logprobs")
                     if candidates is None or len(candidates) != len(token_ids) or any(not row for row in candidates):
                         raise ValueError("MC continuation is missing token-aligned delta_top_logprobs")
+                output_logprobs = getattr(output, "log_probs", None)
+                sampled = tuple(output_logprobs) if output_logprobs is not None else None
+                if config.sampling_config.get("logprobs") and (sampled is None or len(sampled) != len(token_ids)):
+                    raise ValueError("MC continuation is missing token-aligned sampled log-probabilities")
                 return MCContinuation(
                     token_ids,
                     tokenizer.decode(token_ids, skip_special_tokens=config.continuation_skip_special_tokens),
                     delta_top_logprobs=candidates,
+                    sampled_logprobs=sampled if config.sampling_config.get("logprobs") else None,
                 )
         raise ValueError("MC continuation stayed empty after four attempts")
 

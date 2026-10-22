@@ -25,7 +25,7 @@ from pathlib import Path
 
 from .legacy_adapter import adapt_legacy_rows
 from .mc_labeling import MCConfig, label_mc_states_async
-from .sampling_io import load_prompt_rows, score_text, score_texts_async
+from .sampling_io import load_prompt_rows, score_text, score_text_results_async, scorer_metadata
 from .state_selection import select_states
 from .v1_sampler import sample_v1_continuations
 
@@ -59,8 +59,10 @@ def sampling_settings(config: dict, mode: str) -> tuple[dict, MCConfig]:
         "max_tokens": int(mc["max_continuation_tokens"]),
     }
     save_continuations = bool(mc.get("save_continuations", False))
-    if save_continuations and rollout.get("top_k_logprobs") is not None:
-        mc_sampling["delta_top_logprobs"] = int(rollout["top_k_logprobs"])
+    if save_continuations:
+        # Request only sampled-token log-probabilities. Top-k rows would disable
+        # native n-sampling and multiply storage by rollout.top_k_logprobs.
+        mc_sampling["logprobs"] = True
     for key in ("top_k", "min_p"):
         if mc.get(key) is not None:
             mc_sampling[key] = int(mc[key]) if key == "top_k" else float(mc[key])
@@ -74,6 +76,7 @@ def sampling_settings(config: dict, mode: str) -> tuple[dict, MCConfig]:
         assume_legacy_last_token_terminal=False,
         save_individual_rewards=bool(mc.get("save_individual_rewards", False)),
         save_continuations=save_continuations,
+        scorer_metadata=scorer_metadata(),
     )
     if int(selection["max_candidates"]) > int(rollout["top_k_logprobs"]):
         raise ValueError("max_candidates cannot exceed top_k_logprobs")
@@ -207,7 +210,7 @@ def _recover_partial_outputs(
         if (
             state_id in valid_state_ids
             and mode_matches
-            and label.get("mc_num_samples") == continuations_per_state
+            and label.get("mc_requested_samples", label.get("mc_num_samples")) == continuations_per_state
             and (not save_continuations or continuation_indices == expected_indices)
         ):
             labels_by_state[state_id] = label
@@ -341,7 +344,7 @@ async def sample_labeled_rollout(
             decode_prefix=lambda ids: tokenizer.decode(ids, skip_special_tokens=False),
             score=lambda response, row: score_text(response, row["gold_answer"], config.get("reward") or {}),
             request_concurrency=mc_concurrency,
-            score_batch_async=partial(score_texts_async, reward_config=config.get("reward") or {}),
+            score_batch_async=partial(score_text_results_async, reward_config=config.get("reward") or {}),
             score_semaphore=score_semaphore,
             on_label=on_label,
         )
@@ -521,7 +524,11 @@ async def run(
         verl_config.actor_rollout_ref.model.path = model_path
     model_path = str(verl_config.actor_rollout_ref.model.path)
     actor_version = actor_version or model_path
-    mc_config = replace(mc_config, actor_version=actor_version)
+    mc_config = replace(
+        mc_config,
+        actor_version=actor_version,
+        max_total_tokens=int(config["model"]["max_model_len"]),
+    )
     rollout_config = verl_config.actor_rollout_ref.rollout
     rollout_config.name = "vllm"
     rollout_config.mode = "async"
@@ -632,6 +639,10 @@ async def run(
         "mc_mode": mc_mode,
         "config": config,
         "prompts": prompts,
+        "generation_sampling_config": generation,
+        "mc_sampling_config": dict(mc_config.sampling_config),
+        "mc_max_total_tokens": mc_config.max_total_tokens,
+        "mc_scorer": dict(mc_config.scorer_metadata or {}),
     }
     checkpoint_fingerprint = hashlib.sha256(
         json.dumps(checkpoint_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -680,11 +691,40 @@ async def run(
         if rollout.get("sampling_config") != expected_rollout_sampling:
             raise ValueError(f"Partial output rollout sampling config mismatch for {rollout_id}")
         for label in recovered["labels"]:
-            if label.get("mc_actor_version") != actor_version or label.get("mc_sampling_config") != dict(
-                mc_config.sampling_config
+            input_length = len(label.get("prompt_token_ids", [])) + len(label.get("prefix_response_token_ids", []))
+            effective_max_tokens = max(
+                0,
+                min(
+                    int(mc_config.sampling_config["max_tokens"]),
+                    int(mc_config.max_total_tokens) - input_length,
+                ),
+            )
+            expected_mc_sampling = {
+                **mc_config.sampling_config,
+                "max_total_tokens": mc_config.max_total_tokens,
+                "effective_max_tokens": effective_max_tokens,
+            }
+            expected_effective_sampling = {**mc_config.sampling_config, "max_tokens": effective_max_tokens}
+            if (
+                label.get("mc_actor_version") != actor_version
+                or label.get("mc_sampling_config") != expected_mc_sampling
+                or label.get("mc_effective_sampling_config") != expected_effective_sampling
             ):
                 raise ValueError(f"Partial output MC sampling config mismatch for state {label['state_id']}")
     counts = {"prompts": len(prompts), **recovered_counts}
+    timeout_count = sum(
+        int(label.get("mc_timeout_count", 0)) for recovered in resume.values() for label in recovered["labels"]
+    )
+    reward_config = config.get("reward") or {}
+    max_timeouts_per_state = int(reward_config.get("mc_max_timeouts_per_state", 1))
+    max_timeout_fraction = float(reward_config.get("mc_max_timeout_fraction", 0.0001))
+    max_timeout_count = reward_config.get("mc_max_timeout_count")
+    if max_timeouts_per_state < 0 or not 0 <= max_timeout_fraction <= 1:
+        raise ValueError("MC timeout budgets must be nonnegative")
+    if max_timeout_count is not None and (
+        isinstance(max_timeout_count, bool) or not isinstance(max_timeout_count, int) or max_timeout_count < 0
+    ):
+        raise ValueError("reward.mc_max_timeout_count must be a nonnegative integer")
     expected_rollouts = len(prompts) * int(config["smoke"]["responses_per_prompt"])
     ray.init(
         num_gpus=1,
@@ -714,6 +754,14 @@ async def run(
                 counts["states"] += len(states)
 
             def emit_label(rollout, label):
+                nonlocal timeout_count
+                label_timeouts = int(label.get("mc_timeout_count", 0))
+                if label_timeouts > max_timeouts_per_state:
+                    raise RuntimeError(
+                        f"State {label['state_id']} exceeded MC timeout budget: "
+                        f"{label_timeouts} > {max_timeouts_per_state}"
+                    )
+                timeout_count += label_timeouts
                 for continuation in label.pop("mc_continuations", []):
                     continuation_index = continuation["continuation_index"]
                     token_ids = continuation["token_ids"]
@@ -733,13 +781,23 @@ async def run(
                             "continuation_num_tokens": len(token_ids),
                             "empty_continuation": not token_ids,
                             "reward": continuation["reward"],
+                            "score_status": continuation["score_status"],
+                            "score_attempts": continuation["score_attempts"],
+                            "score_timeout_seconds": continuation["score_timeout_seconds"],
+                            **(
+                                {"sampled_logprobs": continuation["sampled_logprobs"]}
+                                if continuation.get("sampled_logprobs") is not None
+                                else {}
+                            ),
                             **(
                                 {"delta_top_logprobs": continuation["delta_top_logprobs"]}
                                 if continuation.get("delta_top_logprobs") is not None
                                 else {}
                             ),
                             "actor_version": mc_config.actor_version,
-                            "sampling_config": dict(mc_config.sampling_config),
+                            "sampling_config": dict(label["mc_effective_sampling_config"]),
+                            "requested_sampling_config": dict(mc_config.sampling_config),
+                            "prompt_transport": "token_ids",
                         },
                     )
                     counts["continuations"] += 1
@@ -779,11 +837,20 @@ async def run(
             expected_continuations = expected_states * mc_config.continuations_per_state
             if counts["continuations"] != expected_continuations:
                 raise RuntimeError(f"Incomplete continuation counts: {counts}")
+        requested_continuations = expected_states * mc_config.continuations_per_state
+        fractional_budget = math.floor(requested_continuations * max_timeout_fraction)
+        allowed_timeouts = fractional_budget if max_timeout_count is None else min(fractional_budget, max_timeout_count)
+        if timeout_count > allowed_timeouts:
+            raise RuntimeError(f"MC timeout budget exceeded: {timeout_count} > {allowed_timeouts}")
         for name in names:
             temporary[name].replace(destinations[name])
     finally:
         ray.shutdown()
-    return {"counts": counts, "files": {name: str(path) for name, path in destinations.items()}}
+    return {
+        "counts": counts,
+        "scoring": {"timeouts": timeout_count, "allowed_timeouts": allowed_timeouts, "unexpected_errors": 0},
+        "files": {name: str(path) for name, path in destinations.items()},
+    }
 
 
 def main() -> None:

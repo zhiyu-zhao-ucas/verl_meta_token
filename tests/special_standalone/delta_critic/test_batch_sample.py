@@ -58,6 +58,8 @@ def test_batch_sample_v1_uncertainty_to_paired_mc():
     assert generation["repetition_penalty"] == 1.05
     assert generation["stop"] == ["\n\n---\n\n"]
     assert generation["include_stop_str_in_output"] is False
+    assert mc_config.sampling_config["logprobs"] is True
+    assert "delta_top_logprobs" not in mc_config.sampling_config
     mc_config = replace(mc_config, actor_version="actor-1")
     prompt = {"prompt_id": "p1", "prompt": "Problem", "gold_answer": "2"}
     output = SimpleNamespace(
@@ -86,9 +88,7 @@ def test_batch_sample_v1_uncertainty_to_paired_mc():
 
         async def generate(self, **kwargs):
             self.calls.append(kwargs)
-            return SimpleNamespace(
-                token_ids=[30], extra_fields={"delta_top_logprobs": [[{"token_id": 30, "prob": 0.7}]]}
-            )
+            return SimpleNamespace(token_ids=[30], log_probs=[-0.1], extra_fields={})
 
     client = Client()
     rollout, states, labels = asyncio.run(
@@ -135,9 +135,7 @@ def test_v1_mc_continuations_keep_sample_order_under_global_limit():
             self.peak = max(self.peak, self.active)
             await asyncio.sleep((4 - index) * 0.001)
             self.active -= 1
-            return SimpleNamespace(
-                token_ids=[index], extra_fields={"delta_top_logprobs": [[{"token_id": index, "prob": 0.7}]]}
-            )
+            return SimpleNamespace(token_ids=[index], log_probs=[-0.1], extra_fields={})
 
     class Tokenizer:
         def decode(self, ids, *, skip_special_tokens):
@@ -194,29 +192,37 @@ def test_v1_mc_continuations_cancel_other_requests_on_error():
 def test_v1_native_mc_outputs_follow_completion_indices():
     path = Path("verl/workers/rollout/vllm_rollout/vllm_async_server.py")
     module = ast.parse(path.read_text())
-    function = next(
-        node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "_collect_delta_mc_token_ids"
-    )
-    namespace = {"Any": object}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    functions = [
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_collect_delta_mc_token_ids", "_collect_delta_mc_sampled_logprobs"}
+    ]
+    namespace = {"Any": object, "math": __import__("math")}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)
     collect = namespace["_collect_delta_mc_token_ids"]
+    collect_logprobs = namespace["_collect_delta_mc_sampled_logprobs"]
 
-    outputs = [SimpleNamespace(index=1, token_ids=[21]), SimpleNamespace(index=0, token_ids=[20])]
+    outputs = [
+        SimpleNamespace(index=1, token_ids=[21], logprobs=[{21: SimpleNamespace(logprob=-0.2)}]),
+        SimpleNamespace(index=0, token_ids=[20], logprobs=[{20: SimpleNamespace(logprob=-0.1)}]),
+    ]
     assert collect(outputs, 2) == [[20], [21]]
+    assert collect_logprobs(outputs, 2) == [[-0.1], [-0.2]]
     with pytest.raises(ValueError, match="incomplete"):
         collect(outputs[:1], 2)
 
 
 @pytest.mark.parametrize(
-    ("mc_sampling_mode", "batch_size", "expected_peak"),
+    ("mc_sampling_mode", "batch_size", "expected_peak", "expected_counts"),
     [
-        ("requests", None, 2),
-        ("native", None, 2),
-        ("native", 1, 2),
+        ("requests", None, 2, [1] * 9),
+        ("native", None, 1, [1] * 3 + [2] * 3),
+        ("native", 1, 2, [1] * 9),
     ],
 )
 def test_collect_labeled_rollouts_overlaps_rollout_and_mc_with_global_limit(
-    mc_sampling_mode, batch_size, expected_peak
+    mc_sampling_mode, batch_size, expected_peak, expected_counts
 ):
     config = _config()
     config["smoke"]["states_per_response"] = 1
@@ -259,10 +265,16 @@ def test_collect_labeled_rollouts_overlaps_rollout_and_mc_with_global_limit(
             self.mc_counts.append(count)
             await asyncio.sleep(0.002)
             self.active_mc -= 1
-            return SimpleNamespace(
-                token_ids=[30],
-                extra_fields={"delta_top_logprobs": [[{"token_id": 30, "prob": 0.7}]]},
-            )
+            if "delta_mc_n" in kwargs["sampling_params"]:
+                return SimpleNamespace(
+                    token_ids=[30],
+                    log_probs=[-0.1],
+                    extra_fields={
+                        "delta_mc_token_ids": [[30] for _ in range(count)],
+                        "delta_mc_sampled_logprobs": [[-0.1] for _ in range(count)],
+                    },
+                )
+            return SimpleNamespace(token_ids=[30], log_probs=[-0.1], extra_fields={})
 
     client = Client()
     collected = []
@@ -295,7 +307,6 @@ def test_collect_labeled_rollouts_overlaps_rollout_and_mc_with_global_limit(
     assert len(streamed_rollouts) == 3
     assert len(streamed_labels) == 3
     assert client.peak_mc == expected_peak
-    expected_counts = [1] * 9
     assert sorted(client.mc_counts) == expected_counts
 
 

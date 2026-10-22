@@ -14,21 +14,57 @@
 """Prompt and math reward handling for the source-compatible sampling path."""
 
 import asyncio
+import importlib.metadata
 import json
 import multiprocessing
 import re
 import threading
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 DEFAULT_MATH_PROMPT_TEMPLATE = (
     "Solve the following math problem carefully.\n"
     "Show your reasoning and put the final answer in \\boxed{{}}.\n\n"
     "Problem:\n{problem}"
 )
+
+
+ScoreStatus = Literal["correct", "incorrect", "unparseable", "timeout"]
+
+
+@dataclass(frozen=True)
+class ScoreResult:
+    """One observable scorer outcome; timeouts are never converted to reward zero."""
+
+    reward: float | None
+    status: ScoreStatus
+    attempts: int
+    timeout_seconds: int | None
+
+
+class ScoringError(RuntimeError):
+    """Unexpected scorer failure that must abort collection."""
+
+
+class ScoringTimeoutError(TimeoutError):
+    """A terminal reward could not be scored after the configured retry."""
+
+
+def scorer_metadata() -> dict[str, Any]:
+    try:
+        version = importlib.metadata.version("math-verify")
+    except importlib.metadata.PackageNotFoundError:
+        version = None
+    return {
+        "name": "math_verify",
+        "math_verify_version": version,
+        "execution_backend": "spawned_process",
+        "raise_on_error": True,
+    }
 
 
 def _first(row: dict, *keys: str):
@@ -184,21 +220,41 @@ def _boxed_answer(text: str) -> str | None:
 
 
 @lru_cache(maxsize=20000)
-def _parse_math(text: str, fallback: str, extraction: str):
+def _parse_math(
+    text: str,
+    fallback: str,
+    extraction: str,
+    parsing_timeout: int,
+    raise_on_error: bool,
+):
     from math_verify import parse
 
-    return tuple(parse(text, fallback_mode=fallback, extraction_mode=extraction))
+    return tuple(
+        parse(
+            text,
+            fallback_mode=fallback,
+            extraction_mode=extraction,
+            parsing_timeout=parsing_timeout,
+            raise_on_error=raise_on_error,
+        )
+    )
 
 
-def _parse_math_answer(text: str, fallback: str, extraction: str):
+def _parse_math_answer(
+    text: str,
+    fallback: str,
+    extraction: str,
+    parsing_timeout: int,
+    raise_on_error: bool,
+):
     """Parse a dataset answer as one expression, retaining textual fallback."""
     delimited = any(marker in text for marker in ("$", r"\(", r"\[", r"\boxed{"))
     is_math = re.search(r"[\\0-9=+*/^_(){}\[\],<>-]", text) or re.fullmatch(r"[A-Za-z]", text.strip())
     if not delimited and is_math:
-        parsed = _parse_math("$" + text + "$", "no_fallback", extraction)
+        parsed = _parse_math("$" + text + "$", "no_fallback", extraction, parsing_timeout, raise_on_error)
         if parsed:
             return parsed
-    return _parse_math(text, fallback, extraction)
+    return _parse_math(text, fallback, extraction, parsing_timeout, raise_on_error)
 
 
 def _final_answer_field(response: str) -> tuple[int, str]:
@@ -228,75 +284,139 @@ def _final_answer_field(response: str) -> tuple[int, str]:
     return match.start(), tail.splitlines()[0].strip() if tail else ""
 
 
-def score_text(response: str, gold_answer: str | None, reward_config: dict) -> float:
-    """Score a response with the same math rule on main and worker threads."""
+def _positive_timeout(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _score_math_once(
+    response: str,
+    gold_answer: str,
+    reward_config: dict,
+    *,
+    timeout_seconds: int,
+) -> tuple[float, ScoreStatus]:
+    from math_verify import verify
+    from sympy import SympifyError
+
+    boxed = _boxed_answer(response)
+    final_answer = None
+    if reward_config.get("math_verify_require_final_answer", False):
+        boxed_position = response.rfind(r"\boxed{")
+        answer_position, answer_field = _final_answer_field(response)
+        if answer_position > boxed_position:
+            final_answer = answer_field
+            boxed = None
+        else:
+            final_answer = boxed
+        if not final_answer:
+            return 0.0, "unparseable"
+    gold_text = str(gold_answer)
+    if reward_config.get("math_verify_simple_first", True):
+        literal_answer = boxed or final_answer
+        if literal_answer and literal_answer.strip() == gold_text.strip():
+            return 1.0, "correct"
+        number_pattern = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
+        if boxed and re.fullmatch(number_pattern, boxed.strip()) and re.fullmatch(number_pattern, gold_text.strip()):
+            if abs(Decimal(boxed.strip()) - Decimal(gold_text.strip())) <= Decimal("1e-6"):
+                return 1.0, "correct"
+    max_boxed_chars = int(reward_config.get("math_verify_max_boxed_chars", 512))
+    if boxed and max_boxed_chars > 0 and len(boxed) > max_boxed_chars:
+        return 0.0, "unparseable"
+    extraction = str(reward_config.get("math_verify_extraction_mode", "first_match"))
+    try:
+        if final_answer is not None:
+            prediction = _parse_math_answer(final_answer, "no_fallback", extraction, timeout_seconds, True)
+        else:
+            prediction = _parse_math(
+                "$" + boxed + "$" if boxed else response,
+                "no_fallback",
+                extraction,
+                timeout_seconds,
+                True,
+            )
+    except SympifyError:
+        # This is a property of an invalid model answer, not a scorer outage.
+        # In particular, SymPy rejects decimal integers beyond Python's
+        # configured digit limit. Gold parsing and verify failures remain
+        # fail-closed below and are never converted into wrong answers.
+        return 0.0, "unparseable"
+    if not prediction:
+        return 0.0, "unparseable"
+    gold = _parse_math_answer(gold_text, "first_match", extraction, timeout_seconds, True)
+    if not gold:
+        raise ScoringError("math-verify could not parse the nonempty gold answer")
+    correct = bool(
+        verify(
+            gold[0],
+            prediction[0],
+            timeout_seconds=timeout_seconds,
+            raise_on_error=True,
+        )
+    )
+    return float(correct), "correct" if correct else "incorrect"
+
+
+def score_text_result(response: str, gold_answer: str | None, reward_config: dict) -> ScoreResult:
+    """Score text with explicit wrong, unparseable, and timeout outcomes."""
     method = reward_config.get("method", "math_verify")
     if method == "exact_or_numeric":
         if gold_answer is None or str(gold_answer).strip() == "":
-            return 0.0
+            return ScoreResult(0.0, "unparseable", 1, None)
         if str(gold_answer).strip().lower() in response.strip().lower():
-            return 1.0
+            return ScoreResult(1.0, "correct", 1, None)
         prediction, gold = _last_number(response), _last_number(str(gold_answer))
-        return float(prediction is not None and gold is not None and abs(float(prediction) - float(gold)) <= 1e-6)
+        if prediction is None or gold is None:
+            return ScoreResult(0.0, "unparseable", 1, None)
+        correct = abs(float(prediction) - float(gold)) <= 1e-6
+        return ScoreResult(float(correct), "correct" if correct else "incorrect", 1, None)
     if method != "math_verify":
         raise ValueError(f"Unsupported reward method={method!r}")
     if gold_answer is None or not str(gold_answer).strip():
-        return 0.0
+        return ScoreResult(0.0, "unparseable", 1, None)
     if threading.current_thread() is not threading.main_thread():
-        # Reward managers call synchronous scorers in an executor thread.
-        # math-verify uses SIGALRM for both parsing and verification; in a
-        # thread it can swallow the signal error and mark correct answers 0.
-        # Reuse the MC scoring process so those timeouts stay enabled.
-        return _reward_executor().submit(score_text, response, gold_answer, dict(reward_config)).result()
+        # math-verify's SIGALRM timeouts require the spawned worker's main thread.
+        return _reward_executor().submit(score_text_result, response, gold_answer, dict(reward_config)).result()
     try:
-        from math_verify import verify
+        from math_verify.errors import TimeoutException
     except ImportError as exc:
         if reward_config.get("fallback_on_import_error", False):
-            return score_text(response, gold_answer, {"method": "exact_or_numeric"})
+            return score_text_result(response, gold_answer, {"method": "exact_or_numeric"})
         raise RuntimeError("reward.method=math_verify requires math-verify") from exc
-    try:
-        boxed = _boxed_answer(response)
-        final_answer = None
-        if reward_config.get("math_verify_require_final_answer", False):
-            boxed_position = response.rfind(r"\boxed{")
-            answer_position, answer_field = _final_answer_field(response)
-            if answer_position > boxed_position:
-                final_answer = answer_field
-                boxed = None  # Do not let an earlier box override this field.
-            else:
-                final_answer = boxed
-            if not final_answer:
-                return 0.0
-        gold_text = str(gold_answer)
-        if reward_config.get("math_verify_simple_first", True):
-            # Leave normalization to math-verify rather than joining digits
-            # across whitespace or changing the case of literal text.
-            literal_answer = boxed or final_answer
-            if literal_answer and literal_answer.strip() == gold_text.strip():
-                return 1.0
-            # Only compare complete numeric literals here. Extracting the
-            # last number accepts unequal fractions with the same denominator
-            # (3/2 and 1/2), or an expression whose final operand is the gold.
-            number_pattern = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
-            if (
-                boxed
-                and re.fullmatch(number_pattern, boxed.strip())
-                and re.fullmatch(number_pattern, gold_text.strip())
-            ):
-                if abs(Decimal(boxed.strip()) - Decimal(gold_text.strip())) <= Decimal("1e-6"):
-                    return 1.0
-        max_boxed_chars = int(reward_config.get("math_verify_max_boxed_chars", 512))
-        if boxed and max_boxed_chars > 0 and len(boxed) > max_boxed_chars:
-            return 0.0
-        extraction = str(reward_config.get("math_verify_extraction_mode", "first_match"))
-        if final_answer is not None:
-            prediction = _parse_math_answer(final_answer, "no_fallback", extraction)
-        else:
-            prediction = _parse_math("$" + boxed + "$" if boxed else response, "no_fallback", extraction)
-        gold = _parse_math_answer(gold_text, "first_match", extraction)
-        return float(bool(prediction and gold and verify(gold[0], prediction[0])))
-    except Exception:
-        return 0.0
+    first_timeout = _positive_timeout(
+        reward_config.get("math_verify_timeout_seconds", 5), "math_verify_timeout_seconds"
+    )
+    retry_timeout = _positive_timeout(
+        reward_config.get("math_verify_retry_timeout_seconds", 20), "math_verify_retry_timeout_seconds"
+    )
+    for attempt, timeout_seconds in enumerate((first_timeout, retry_timeout), start=1):
+        try:
+            reward, status = _score_math_once(
+                response,
+                str(gold_answer),
+                reward_config,
+                timeout_seconds=timeout_seconds,
+            )
+            return ScoreResult(reward, status, attempt, timeout_seconds)
+        except TimeoutException:
+            if attempt == 2:
+                return ScoreResult(None, "timeout", attempt, timeout_seconds)
+        except ScoringError:
+            raise
+        except Exception as exc:
+            raise ScoringError(f"Unexpected math-verify {type(exc).__name__}") from exc
+    raise AssertionError("unreachable scorer retry state")
+
+
+def score_text(response: str, gold_answer: str | None, reward_config: dict) -> float:
+    """Backward-compatible scalar API; terminal scoring cannot exclude timeouts."""
+    result = score_text_result(response, gold_answer, reward_config)
+    if result.reward is None:
+        raise ScoringTimeoutError(
+            f"math-verify timed out after {result.attempts} attempts (last timeout={result.timeout_seconds}s)"
+        )
+    return result.reward
 
 
 _reward_pool = None
@@ -316,12 +436,25 @@ def _reward_executor():
         return _reward_pool
 
 
-def _score_texts(responses, gold_answer, reward_config):
-    return [score_text(response, gold_answer, reward_config) for response in responses]
+def _score_text_results(responses, gold_answer, reward_config):
+    return [score_text_result(response, gold_answer, reward_config) for response in responses]
+
+
+async def score_text_results_async(responses, row, *, reward_config):
+    """Return structured MC outcomes from the spawned scorer process."""
+    return await asyncio.get_running_loop().run_in_executor(
+        _reward_executor(), _score_text_results, list(responses), row["gold_answer"], dict(reward_config)
+    )
 
 
 async def score_texts_async(responses, row, *, reward_config):
-    """Score a prefix's completions off the event loop, with working math timeouts."""
-    return await asyncio.get_running_loop().run_in_executor(
-        _reward_executor(), _score_texts, list(responses), row["gold_answer"], dict(reward_config)
-    )
+    """Backward-compatible float API; timeout-aware MC callers use results."""
+    results = await score_text_results_async(responses, row, reward_config=reward_config)
+    rewards = []
+    for result in results:
+        if result.reward is None:
+            raise ScoringTimeoutError(
+                f"math-verify timed out after {result.attempts} attempts (last timeout={result.timeout_seconds}s)"
+            )
+        rewards.append(result.reward)
+    return rewards

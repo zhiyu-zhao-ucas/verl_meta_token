@@ -94,6 +94,28 @@ def _collect_delta_mc_token_ids(outputs: list[Any], count: int) -> list[list[int
     return [list(item.token_ids) for item in completions]
 
 
+def _collect_delta_mc_sampled_logprobs(outputs: list[Any], count: int) -> list[list[float]]:
+    completions = sorted(outputs, key=lambda item: item.index)
+    if len(completions) != count or [item.index for item in completions] != list(range(count)):
+        raise ValueError("vLLM returned an incomplete delta_mc_n result")
+    rows = []
+    for completion in completions:
+        token_ids = list(completion.token_ids)
+        logprobs = completion.logprobs
+        if logprobs is None or len(logprobs) != len(token_ids):
+            raise ValueError("vLLM omitted token-aligned sampled log-probabilities for delta_mc_n")
+        row = []
+        for token_id, candidates in zip(token_ids, logprobs, strict=True):
+            if token_id not in candidates:
+                raise ValueError("vLLM sampled token is absent from its delta_mc_n log-probabilities")
+            value = float(candidates[token_id].logprob)
+            if not math.isfinite(value) or value > 0:
+                raise ValueError("vLLM returned an invalid sampled-token log-probability")
+            row.append(value)
+        rows.append(row)
+    return rows
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -752,6 +774,10 @@ class vLLMHttpServer:
         extra_fields["num_cached_tokens"] = getattr(final_res, "num_cached_tokens", None)
         if delta_mc_n is not None:
             extra_fields["delta_mc_token_ids"] = _collect_delta_mc_token_ids(final_res.outputs, delta_mc_n)
+            if sampling_params.logprobs is not None:
+                extra_fields["delta_mc_sampled_logprobs"] = _collect_delta_mc_sampled_logprobs(
+                    final_res.outputs, delta_mc_n
+                )
         extract_prompt_logprobs(
             output=final_res,
             num_prompt_logprobs=sampling_params.prompt_logprobs,

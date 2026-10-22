@@ -231,7 +231,7 @@ def test_mc_metadata_alignment_and_online_export_preserve_actor_probabilities(tm
         )
 
 
-def test_offline_sampling_requests_top_probs_only_when_saved():
+def test_offline_sampling_requests_sampled_logprobs_only_when_saved():
     config = {
         "smoke": {"states_per_response": 1},
         "rollout": {"temperature": 0.7, "top_p": 0.9, "max_tokens": 20, "top_k_logprobs": 7},
@@ -250,8 +250,9 @@ def test_offline_sampling_requests_top_probs_only_when_saved():
     config["mc"]["save_continuations"] = False
     _, unsaved = sampling_settings(config, "prefix_only")
 
-    assert saved.sampling_config["delta_top_logprobs"] == 7
-    assert "delta_top_logprobs" not in unsaved.sampling_config
+    assert saved.sampling_config["logprobs"] is True
+    assert "delta_top_logprobs" not in saved.sampling_config
+    assert "logprobs" not in unsaved.sampling_config
 
 
 def test_top_probability_validator_requires_token_alignment():

@@ -30,6 +30,10 @@ prompt:
 reward:
   method: math_verify
   fallback_on_import_error: false
+  math_verify_timeout_seconds: 5
+  math_verify_retry_timeout_seconds: 20
+  mc_max_timeout_fraction: 0.0001
+  mc_max_timeouts_per_state: 1
 smoke:
   train_prompts: 512
   test_prompts: 100

@@ -32,6 +32,7 @@ from examples.delta_critic.mc_labeling import (
     label_mc_states,
     label_mc_states_async,
 )
+from examples.delta_critic.sampling_io import ScoreResult
 from examples.delta_critic.state_selection import select_spaced_states, select_states
 from examples.delta_critic.v1_sampler import sample_v1_continuations
 
@@ -196,8 +197,24 @@ def test_mc_end_to_end_terminal_and_request_dedup():
     assert by_index[2]["delta"] == 0.5
     assert by_index[2]["mc_actor_version"] == "actor-step-7"
     assert by_index[1]["mc_continuations"] == [
-        {"continuation_index": 0, "token_ids": [30], "text": "1", "reward": 1.0},
-        {"continuation_index": 1, "token_ids": [31], "text": "0", "reward": 0.0},
+        {
+            "continuation_index": 0,
+            "token_ids": [30],
+            "text": "1",
+            "reward": 1.0,
+            "score_status": "scored",
+            "score_attempts": 1,
+            "score_timeout_seconds": None,
+        },
+        {
+            "continuation_index": 1,
+            "token_ids": [31],
+            "text": "0",
+            "reward": 0.0,
+            "score_status": "scored",
+            "score_attempts": 1,
+            "score_timeout_seconds": None,
+        },
     ]
     examples, diagnostics = adapt_legacy_rows(rollouts, labels)
     assert len(examples[0].states) == 2 and not diagnostics
@@ -221,6 +238,30 @@ def test_mc_nonterminal_last_token_and_validation():
     tool_rollout[0]["policy_token_mask"][1] = 0
     with pytest.raises(ValueError, match="single-turn"):
         build_mc_requests(tool_rollout, states, _config())
+
+
+def test_mc_timeout_is_recorded_and_excluded_from_success_counts():
+    rollouts = _rollout()
+    rid = rollouts[0]["id"]
+    states = select_states(rollouts, strategy="indices", states_per_response=1, indices_by_rollout={rid: [2]})
+    labels = label_mc_states(
+        rollouts,
+        states,
+        _config(mode="prefix_only", save_individual_rewards=True, save_continuations=True),
+        sample=lambda request, sampling: [MCContinuation((30,), "1"), MCContinuation((31,), "slow")],
+        decode_prefix=lambda ids: "",
+        score=lambda response, rollout: (
+            ScoreResult(1.0, "correct", 1, 5) if response == "1" else ScoreResult(None, "timeout", 2, 20)
+        ),
+    )
+    label = labels[0]
+    assert label["v_prefix"] == 1.0
+    assert label["mc_requested_samples"] == 2
+    assert label["mc_num_samples"] == 1
+    assert label["mc_timeout_count"] == 1
+    assert label["prefix_continuation_rewards"] == [1.0]
+    assert label["mc_continuations"][1]["reward"] is None
+    assert label["mc_continuations"][1]["score_status"] == "timeout"
 
 
 def test_v1_server_client_sampler_round_trip():

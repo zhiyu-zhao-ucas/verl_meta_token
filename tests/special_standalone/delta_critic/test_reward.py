@@ -35,6 +35,7 @@ from examples.delta_critic.reward import compute_score
         (r"\boxed{\frac{3}{2}}", r"\frac{1}{2}", 0.0),
         (r"\boxed{3/2}", "1/2", 0.0),
         (r"\boxed{1+2}", "2", 0.0),
+        (r"\boxed{\sqrt{17} - \frac{17}{8}}", "8", 0.0),
         (r"\boxed{\frac{1}{2}}", "2", 0.0),
         (r"\boxed{2.0000001}", "2", 1.0),
         (r"\boxed{5e-1}", "0.5", 0.0),
@@ -130,6 +131,83 @@ def test_scoring_worker_failure_is_not_a_wrong_answer(monkeypatch):
         future = threads.submit(compute_score, "math_dapo", "Answer: 7927", "7927")
         with pytest.raises(RuntimeError, match="scoring worker failed"):
             future.result(timeout=5)
+
+
+def test_math_verify_timeout_retries_once(monkeypatch):
+    pytest.importorskip("math_verify")
+    from math_verify.errors import TimeoutException
+
+    calls = []
+
+    def score_once(response, gold, config, *, timeout_seconds):
+        calls.append(timeout_seconds)
+        if len(calls) == 1:
+            raise TimeoutException("first attempt")
+        return 1.0, "correct"
+
+    monkeypatch.setattr(sampling_io, "_score_math_once", score_once)
+    result = sampling_io.score_text_result("Answer: 2", "2", {})
+    assert result == sampling_io.ScoreResult(1.0, "correct", 2, 20)
+    assert calls == [5, 20]
+
+
+def test_repeated_math_verify_timeout_is_excludable_but_scalar_api_fails(monkeypatch):
+    pytest.importorskip("math_verify")
+    from math_verify.errors import TimeoutException
+
+    def timeout(*args, **kwargs):
+        raise TimeoutException("still slow")
+
+    monkeypatch.setattr(sampling_io, "_score_math_once", timeout)
+    assert sampling_io.score_text_result("Answer: 2", "2", {}) == sampling_io.ScoreResult(None, "timeout", 2, 20)
+    with pytest.raises(sampling_io.ScoringTimeoutError):
+        sampling_io.score_text("Answer: 2", "2", {})
+
+
+def test_unexpected_math_verify_error_is_not_a_wrong_answer(monkeypatch):
+    pytest.importorskip("math_verify")
+
+    def fail(*args, **kwargs):
+        raise ValueError("internal parser failure")
+
+    monkeypatch.setattr(sampling_io, "_score_math_once", fail)
+    with pytest.raises(sampling_io.ScoringError, match="ValueError"):
+        sampling_io.score_text_result("Answer: 2", "2", {})
+
+
+def test_pathological_integer_is_an_unparseable_answer_not_a_scorer_failure():
+    pytest.importorskip("math_verify")
+    sampling_io._parse_math.cache_clear()
+    response = "Answer: " + "5" * 5000
+    result = sampling_io.score_text_result(response, "2", {})
+    worker_result = asyncio.run(
+        sampling_io.score_text_results_async([response], {"gold_answer": "2"}, reward_config={})
+    )[0]
+    assert result == worker_result == sampling_io.ScoreResult(0.0, "unparseable", 1, 5)
+
+
+def test_math_verify_calls_enable_error_propagation(monkeypatch):
+    math_verify = pytest.importorskip("math_verify")
+    parsed = object()
+    parse_calls = []
+    verify_calls = []
+
+    def parse(text, **kwargs):
+        parse_calls.append(kwargs)
+        return [parsed]
+
+    def verify(gold, prediction, **kwargs):
+        verify_calls.append(kwargs)
+        return False
+
+    monkeypatch.setattr(math_verify, "parse", parse)
+    monkeypatch.setattr(math_verify, "verify", verify)
+    sampling_io._parse_math.cache_clear()
+    result = sampling_io.score_text_result("$1$", "2", {})
+    assert result.status == "incorrect" and result.reward == 0.0
+    assert parse_calls and all(call["raise_on_error"] is True for call in parse_calls)
+    assert verify_calls == [{"timeout_seconds": 5, "raise_on_error": True}]
+    sampling_io._parse_math.cache_clear()
 
 
 def test_dynamically_loaded_reward_can_score_from_thread():

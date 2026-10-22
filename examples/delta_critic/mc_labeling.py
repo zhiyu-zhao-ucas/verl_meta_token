@@ -38,6 +38,7 @@ class MCContinuation:
     token_ids: tuple[int, ...]
     text: str
     delta_top_logprobs: list[list[dict[str, Any]]] | None = None
+    sampled_logprobs: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class MCConfig:
     max_total_tokens: int | None = None
     max_response_total_tokens: int | None = None
     require_nonempty: bool = False
+    scorer_metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self):
         if self.mode not in {"prefix_only", "paired_next_state"}:
@@ -82,6 +84,92 @@ class MCConfig:
             or self.max_response_total_tokens < 1
         ):
             raise ValueError("max_response_total_tokens must be a positive integer")
+
+
+def _score_outcome(value: Any) -> tuple[float | None, str, int, int | None]:
+    """Normalize legacy float scorers and structured fail-closed scorers."""
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        reward = float(value)
+        if not isfinite(reward):
+            raise ValueError("MC reward must be finite")
+        return reward, "scored", 1, None
+    if isinstance(value, Mapping):
+        reward = value.get("reward")
+        status = value.get("status")
+        attempts = value.get("attempts", 1)
+        timeout_seconds = value.get("timeout_seconds")
+    else:
+        reward = getattr(value, "reward", None)
+        status = getattr(value, "status", None)
+        attempts = getattr(value, "attempts", 1)
+        timeout_seconds = getattr(value, "timeout_seconds", None)
+    if status not in {"correct", "incorrect", "unparseable", "timeout"}:
+        raise ValueError(f"MC scorer returned unsupported status={status!r}")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+        raise ValueError("MC scorer attempts must be a positive integer")
+    if status == "timeout":
+        if reward is not None:
+            raise ValueError("Timed-out MC scores must not carry a reward")
+        return None, status, attempts, timeout_seconds
+    if reward is None:
+        raise ValueError("Non-timeout MC scores require a reward")
+    reward = float(reward)
+    if not isfinite(reward):
+        raise ValueError("MC reward must be finite")
+    return reward, status, attempts, timeout_seconds
+
+
+def _validate_sampled_logprobs(token_ids, sampled_logprobs, *, context="MC continuation"):
+    if sampled_logprobs is None:
+        return None
+    if not isinstance(sampled_logprobs, Sequence) or isinstance(sampled_logprobs, str | bytes):
+        raise ValueError(f"{context} sampled_logprobs must be a sequence")
+    if len(sampled_logprobs) != len(token_ids):
+        raise ValueError(
+            f"{context} sampled_logprobs must align with token_ids: "
+            f"{len(sampled_logprobs)} values for {len(token_ids)} tokens"
+        )
+    values = tuple(float(value) for value in sampled_logprobs)
+    if any(not isfinite(value) or value > 0 for value in values):
+        raise ValueError(f"{context} sampled_logprobs must be finite and nonpositive")
+    return values
+
+
+def _summarize_continuations(continuations, score_values, *, save_continuations):
+    if len(score_values) != len(continuations):
+        raise ValueError("MC scorer returned a count different from continuations")
+    rewards, records = [], []
+    empty = timeouts = 0
+    for continuation_index, (continuation, score_value) in enumerate(zip(continuations, score_values, strict=True)):
+        reward, status, attempts, timeout_seconds = _score_outcome(score_value)
+        empty += not continuation.token_ids
+        timeouts += status == "timeout"
+        if reward is not None:
+            rewards.append(reward)
+        if save_continuations:
+            sampled = _validate_sampled_logprobs(continuation.token_ids, continuation.sampled_logprobs)
+            if continuation.delta_top_logprobs is not None:
+                validate_delta_top_logprobs(continuation.token_ids, continuation.delta_top_logprobs)
+            records.append(
+                {
+                    "continuation_index": continuation_index,
+                    "token_ids": list(continuation.token_ids),
+                    "text": continuation.text,
+                    "reward": reward,
+                    "score_status": status,
+                    "score_attempts": attempts,
+                    "score_timeout_seconds": timeout_seconds,
+                    **({"sampled_logprobs": list(sampled)} if sampled is not None else {}),
+                    **(
+                        {"delta_top_logprobs": continuation.delta_top_logprobs}
+                        if continuation.delta_top_logprobs is not None
+                        else {}
+                    ),
+                }
+            )
+    if not rewards:
+        raise ValueError("Every MC continuation timed out; the state has no valid trials")
+    return sum(rewards) / len(rewards), rewards, empty, records, len(continuations), timeouts
 
 
 def build_mc_requests(
@@ -168,32 +256,14 @@ def label_mc_states(
         if len(continuations) != config.continuations_per_state:
             raise ValueError("MC sampler returned a count different from continuations_per_state")
         prefix_text = decode_prefix(request.prefix_response_token_ids)
-        rewards = []
-        empty = 0
-        records = []
-        for continuation_index, continuation in enumerate(continuations):
-            reward = float(score(prefix_text + continuation.text, rollout_map[request.rollout_id]))
-            if not isfinite(reward):
-                raise ValueError("MC reward must be finite")
-            rewards.append(reward)
-            empty += not continuation.token_ids
-            if config.save_continuations:
-                if continuation.delta_top_logprobs is not None:
-                    validate_delta_top_logprobs(continuation.token_ids, continuation.delta_top_logprobs)
-                records.append(
-                    {
-                        "continuation_index": continuation_index,
-                        "token_ids": list(continuation.token_ids),
-                        "text": continuation.text,
-                        "reward": reward,
-                        **(
-                            {"delta_top_logprobs": continuation.delta_top_logprobs}
-                            if continuation.delta_top_logprobs is not None
-                            else {}
-                        ),
-                    }
-                )
-        values[request] = (sum(rewards) / len(rewards), rewards, empty, records)
+        score_values = [
+            score(prefix_text + continuation.text, rollout_map[request.rollout_id]) for continuation in continuations
+        ]
+        values[request] = _summarize_continuations(
+            continuations,
+            score_values,
+            save_continuations=config.save_continuations,
+        )
     return _assemble_labels(rollouts, states, config, links, values)
 
 
@@ -208,7 +278,7 @@ async def label_mc_states_async(
     request_concurrency: int = 1,
     score_in_thread: bool = False,
     score_semaphore: asyncio.Semaphore | None = None,
-    score_batch_async: Callable[[list[str], dict[str, Any]], Awaitable[Sequence[float]]] | None = None,
+    score_batch_async: Callable[[list[str], dict[str, Any]], Awaitable[Sequence[Any]]] | None = None,
     on_label: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Async variant for the V1 LLM server client.
@@ -230,50 +300,33 @@ async def label_mc_states_async(
         if len(continuations) != config.continuations_per_state:
             raise ValueError("MC sampler returned a count different from continuations_per_state")
 
-        async_rewards = None
+        async_scores = None
         if score_batch_async is not None:
             prefix_text = decode_prefix(request.prefix_response_token_ids)
             texts = [prefix_text + continuation.text for continuation in continuations]
             if score_semaphore is None:
-                async_rewards = list(await score_batch_async(texts, rollout_map[request.rollout_id]))
+                async_scores = list(await score_batch_async(texts, rollout_map[request.rollout_id]))
             else:
                 async with score_semaphore:
-                    async_rewards = list(await score_batch_async(texts, rollout_map[request.rollout_id]))
-            if len(async_rewards) != len(continuations):
+                    async_scores = list(await score_batch_async(texts, rollout_map[request.rollout_id]))
+            if len(async_scores) != len(continuations):
                 raise ValueError("MC scorer returned a count different from continuations")
 
         def score_continuations():
             prefix_text = decode_prefix(request.prefix_response_token_ids)
-            rewards = []
-            empty = 0
-            records = []
-            for continuation_index, continuation in enumerate(continuations):
-                reward = float(
-                    async_rewards[continuation_index]
-                    if async_rewards is not None
-                    else score(prefix_text + continuation.text, rollout_map[request.rollout_id])
-                )
-                if not isfinite(reward):
-                    raise ValueError("MC reward must be finite")
-                rewards.append(reward)
-                empty += not continuation.token_ids
-                if config.save_continuations:
-                    if continuation.delta_top_logprobs is not None:
-                        validate_delta_top_logprobs(continuation.token_ids, continuation.delta_top_logprobs)
-                    records.append(
-                        {
-                            "continuation_index": continuation_index,
-                            "token_ids": list(continuation.token_ids),
-                            "text": continuation.text,
-                            "reward": reward,
-                            **(
-                                {"delta_top_logprobs": continuation.delta_top_logprobs}
-                                if continuation.delta_top_logprobs is not None
-                                else {}
-                            ),
-                        }
-                    )
-            return sum(rewards) / len(rewards), rewards, empty, records
+            score_values = (
+                async_scores
+                if async_scores is not None
+                else [
+                    score(prefix_text + continuation.text, rollout_map[request.rollout_id])
+                    for continuation in continuations
+                ]
+            )
+            return _summarize_continuations(
+                continuations,
+                score_values,
+                save_continuations=config.save_continuations,
+            )
 
         if score_in_thread:
             if score_semaphore is None:
@@ -318,7 +371,17 @@ def _assemble_labels(rollouts, states, config, links, values):
     labels = []
     for state in states:
         before, after = links[str(state["state_id"])]
-        value, rewards, empty, records = values[before]
+        value, rewards, empty, records, requested, timeouts = values[before]
+        effective_max_tokens = int(config.sampling_config["max_tokens"])
+        if config.max_response_total_tokens is not None:
+            effective_max_tokens = min(
+                effective_max_tokens,
+                config.max_response_total_tokens - len(before.prefix_response_token_ids),
+            )
+        if config.max_total_tokens is not None:
+            effective_max_tokens = min(effective_max_tokens, config.max_total_tokens - len(before.input_ids))
+        effective_max_tokens = max(0, effective_max_tokens)
+        effective_sampling_config = {**config.sampling_config, "max_tokens": effective_max_tokens}
         row = {
             "state_id": state["state_id"],
             "rollout_id": state["rollout_id"],
@@ -329,6 +392,9 @@ def _assemble_labels(rollouts, states, config, links, values):
             "prefix_response_token_ids": list(before.prefix_response_token_ids),
             "v_prefix": value,
             "mc_num_samples": len(rewards),
+            "mc_requested_samples": requested,
+            "mc_timeout_count": timeouts,
+            "mc_scorer_error_count": 0,
             "mc_empty_continuations": empty,
             "mc_sampling_config": {
                 **config.sampling_config,
@@ -361,8 +427,10 @@ def _assemble_labels(rollouts, states, config, links, values):
                     else {}
                 ),
             },
+            "mc_effective_sampling_config": effective_sampling_config,
             "mc_actor_version": config.actor_version,
             "mc_continuation_skip_special_tokens": config.continuation_skip_special_tokens,
+            **({"mc_scorer": dict(config.scorer_metadata)} if config.scorer_metadata is not None else {}),
         }
         if config.save_individual_rewards:
             row["prefix_continuation_rewards"] = rewards
@@ -371,15 +439,17 @@ def _assemble_labels(rollouts, states, config, links, values):
         if config.mode == "paired_next_state":
             if after is None:
                 next_value = float(rollout_map[before.rollout_id]["terminal_reward"])
-                next_rewards, next_empty = [], 0
+                next_rewards, next_empty, next_requested, next_timeouts = [], 0, 0, 0
             else:
-                next_value, next_rewards, next_empty, _ = values[after]
+                next_value, next_rewards, next_empty, _, next_requested, next_timeouts = values[after]
                 if config.save_individual_rewards:
                     row["next_continuation_rewards"] = next_rewards
             row.update(
                 v_next=next_value,
                 delta=next_value - value,
                 mc_next_num_samples=len(next_rewards),
+                mc_next_requested_samples=next_requested,
+                mc_next_timeout_count=next_timeouts,
                 mc_next_empty_continuations=next_empty,
             )
         labels.append(row)
