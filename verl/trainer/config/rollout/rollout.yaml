@@ -38,6 +38,9 @@ prompt_length: ${oc.select:data.max_prompt_length,512}
 # same as data.max_response_length if it exists
 response_length: ${oc.select:data.max_response_length,512}
 
+# Optional V1 training generation limit; null uses response_length for both phases.
+train_response_length: null
+
 # for vllm rollout
 # Rollout model parameters type. Align with actor model's FSDP/Megatron type.
 dtype: bfloat16

@@ -302,6 +302,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         epochs = tu.pop(data, key="epochs", default=1)
         seed = tu.pop(data, key="seed", default=42)
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+        scheduler_per_minibatch = tu.pop(data, key="scheduler_per_minibatch", default=False)
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
@@ -353,7 +354,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 tu.assign_non_tensor(
                     mini_batch_td,
                     global_token_num=NonTensorData(global_token_num),
-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
+                    update_lr_scheduler=scheduler_per_minibatch or batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
                 # Name the mini-batch in the trace so each iteration of this otherwise identical

@@ -26,6 +26,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from tensordict import TensorDict
 
@@ -103,3 +104,21 @@ def test_forward_only_stage_is_not_a_profiler_step():
 
     assert TrainingWorker.infer_batch(worker, data) is None
     worker.profiler.step.assert_not_called()
+
+
+@pytest.mark.parametrize("per_minibatch,expected", [(False, [False, False, True]), (True, [True, True, True])])
+def test_scheduler_update_frequency(monkeypatch, per_minibatch, expected):
+    mini_batches = [TensorDict({}, batch_size=[]) for _ in range(3)]
+    monkeypatch.setattr(tu, "make_iterator", lambda data, **kwargs: iter(mini_batches))
+    worker = _worker(_engine())
+    updates = []
+
+    def train_batch(data):
+        updates.append(tu.get(data, key="update_lr_scheduler"))
+        return {}
+
+    worker.train_batch = train_batch
+    data = TensorDict({}, batch_size=[3])
+    tu.assign_non_tensor(data, num_mini_batch=3, scheduler_per_minibatch=per_minibatch)
+    TrainingWorker.train_mini_batch(worker, data)
+    assert updates == expected

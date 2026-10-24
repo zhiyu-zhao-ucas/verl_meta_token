@@ -81,6 +81,23 @@ class SingleTurnAgentLoop(AgentLoopBase):
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
 
+        if self.config.algorithm.get("adv_estimator") == "vineppo":
+            # VinePPO aligns official text steps to exactly these generated IDs.
+            # Chat-template merging may append or rewrite tokens and is not valid here.
+            if len(output.token_ids) > self.response_length:
+                raise ValueError("VinePPO main generation exceeded response_length")
+            return AgentLoopOutput(
+                prompt_ids=prompt_ids,
+                response_ids=output.token_ids,
+                response_mask=[1] * len(output.token_ids),
+                response_logprobs=output.log_probs,
+                routed_experts=output.routed_experts,
+                multi_modal_data=multi_modal_data,
+                num_turns=2,
+                metrics=metrics,
+                extra_fields=output.extra_fields,
+            )
+
         merge_result, response_mask, response_logprobs = await self.ct_merge_assistant_token(
             prompt_ids,
             output.token_ids,

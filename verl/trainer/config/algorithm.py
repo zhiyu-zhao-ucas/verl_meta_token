@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from verl.base_config import BaseConfig
+from verl.trainer.ppo.vineppo.config import VinePPOConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig", "VinePPOConfig"]
 
 
 @dataclass
@@ -655,6 +656,7 @@ class AlgoConfig(BaseConfig):
     gamma: float = 1.0
     lam: float = 1.0
     adv_estimator: str = "gae"
+    vineppo: VinePPOConfig = field(default_factory=VinePPOConfig)
     norm_adv_by_std_in_grpo: bool = True
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"

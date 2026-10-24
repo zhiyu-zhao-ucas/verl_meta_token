@@ -23,6 +23,9 @@ weight_decay: 0.01
 # LR warmup steps
 lr_warmup_steps: -1
 
+# v1 trainer: count LR warmup and schedule steps in optimizer minibatches.
+step_lr_scheduler_per_minibatch: false
+
 # Betas for Adam optimizer
 betas: [0.9, 0.999]
 

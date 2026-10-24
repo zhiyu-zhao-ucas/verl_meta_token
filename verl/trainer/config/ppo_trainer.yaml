@@ -77,6 +77,55 @@ algorithm:
   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
   adv_estimator: gae
 
+  # Native VinePPO: official text splitting, independent MC values, actor microbatch whitening.
+  vineppo:
+
+    # Typed algorithm configuration.
+    _target_: verl.trainer.config.VinePPOConfig
+
+    # Independent continuations per selected text state.
+    mc_samples: 9
+
+    # Fresh continuation horizon; not the remaining original response budget.
+    mc_max_new_tokens: 1024
+
+    # Total MC context budget; null uses the rollout engine context limit.
+    mc_context_length: null
+
+    # Official task splitter: math or gsm8k.
+    splitter: math
+
+    # Variant, not upstream: fold steps holding only a closing \] / $$ / \end{...} into the previous step.
+    merge_closing_steps: false
+
+    # Variant, not upstream: merge consecutive official steps until each has at least this many
+    # generated tokens (the final step may be shorter). 0 keeps the official steps.
+    min_step_tokens: 0
+
+    # Intermediate states after root; null selects all for MATH or 25 for GSM8K.
+    max_step_for_value_estimation: null
+
+    # Maximum in-flight MC requests per agent worker; vLLM batches them, so a long
+    # trajectory's MC states do not serialize behind a small limit.
+    concurrency: 128
+
+    # Additional attempts for generation TimeoutError or ConnectionError only.
+    max_retries: 2
+
+    # Delay in seconds between transient generation attempts.
+    retry_delay: 1.0
+
+    # Task reward for a normal length-truncated main response or continuation.
+    unfinished_reward: 0.0
+
+    # Task reward when the verifier raises or times out (upstream grades these as incorrect).
+    # Errors are counted in vineppo/main_score_error_rate, vineppo/mc_score_error_rate and the
+    # validation score_error field. null aborts the round instead, e.g. to debug an unparseable gold.
+    score_error_reward: 0.0
+
+    # Separate k3 KL loss coefficient; zero disables the reference worker.
+    kl_coef: 0.0001
+
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 

@@ -57,6 +57,36 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
+    if config.vineppo:
+        from verl.trainer.ppo.vineppo.core import microbatch_loss
+
+        accumulation = tu.get_non_tensor_data(data, "num_micro_batches", None)
+        if accumulation is None:
+            raise ValueError("VinePPO loss requires the actual actor microbatch accumulation count")
+        fields = ["response_mask", "old_log_probs", "advantages"]
+        if config.use_kl_loss:
+            fields.append("ref_log_prob")
+        padded = data.select(*fields).to_padded_tensor()
+        loss, values = microbatch_loss(
+            padded["old_log_probs"],
+            log_prob,
+            padded["advantages"],
+            padded["response_mask"],
+            ref_log_prob=padded.get("ref_log_prob"),
+            clip_low=config.clip_ratio_low,
+            clip_high=config.clip_ratio_high,
+            kl_coef=config.kl_loss_coef if config.use_kl_loss else 0,
+            num_micro_batches=accumulation,
+            dp_group=dp_group,
+        )
+        metrics = {
+            name: Metric(
+                value=value,
+                aggregation=AggregationType.SUM if name in ("actor/pg_loss", "actor/kl_loss") else AggregationType.MEAN,
+            )
+            for name, value in values.items()
+        }
+        return loss, metrics
     entropy = model_output.get("entropy", None)
     if entropy is not None:
         entropy = no_padding_2_padding(entropy, data)

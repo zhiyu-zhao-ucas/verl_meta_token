@@ -132,6 +132,7 @@ class ReplayBuffer:
         gen_batch_size (int, optional): Dataloader fetch granularity for refill dispatches.
         max_inflight_gen_batches (int): Maximum Sync DAPO prompt batches concurrently pending or running.
         sync_refill_failed_groups (bool): Whether sync sampling replaces failed groups with no trajectories.
+        fail_on_generation_error (bool): Abort on failed sessions instead of padding or refilling them.
     """
 
     def __init__(
@@ -148,6 +149,7 @@ class ReplayBuffer:
         gen_batch_size: int | None = None,
         max_inflight_gen_batches: int = 1,
         sync_refill_failed_groups: bool = False,
+        fail_on_generation_error: bool = False,
     ):
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
@@ -161,6 +163,7 @@ class ReplayBuffer:
         self.gen_batch_size = gen_batch_size
         self.max_inflight_gen_batches = max_inflight_gen_batches
         self.sync_refill_failed_groups = sync_refill_failed_groups
+        self.fail_on_generation_error = fail_on_generation_error
 
         if self.max_off_policy_threshold is not None:
             assert isinstance(self.max_off_policy_threshold, int) and self.max_off_policy_threshold > 0, (
@@ -225,6 +228,10 @@ class ReplayBuffer:
                         case "finished":
                             self.finished_keys[partition_id].add(key)
                         case "failure":
+                            if self.fail_on_generation_error:
+                                raise RuntimeError(
+                                    f"Generation failed for {partition_id}/{key}; aborting the training round"
+                                )
                             self.failure_keys[partition_id].add(key)
                         case _:
                             raise ValueError(f"Unknown status: {tag['status']}")

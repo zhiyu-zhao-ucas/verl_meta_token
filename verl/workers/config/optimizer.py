@@ -49,6 +49,8 @@ class OptimizerConfig(BaseConfig):
     total_training_steps: int = -1
     weight_decay: float = 0.01
     lr_warmup_steps: Optional[int] = -1
+    # v1 trainer: advance the schedule after every optimizer minibatch.
+    step_lr_scheduler_per_minibatch: bool = False
     betas: tuple[float, float] = (0.9, 0.999)
     clip_grad: float = 1.0
     # deprecate grad_clip

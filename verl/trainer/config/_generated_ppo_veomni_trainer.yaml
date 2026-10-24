@@ -71,6 +71,7 @@ actor_rollout_ref:
     _target_: verl.workers.config.VeOmniActorConfig
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
     strategy: veomni
+    vineppo: false
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: null
     ppo_micro_batch_size_per_gpu: null
@@ -282,6 +283,7 @@ actor_rollout_ref:
     seed: 42
     prompt_length: ${oc.select:data.max_prompt_length,512}
     response_length: ${oc.select:data.max_response_length,512}
+    train_response_length: null
     dtype: bfloat16
     gpu_memory_utilization: 0.5
     standalone_gpu_memory_utilization: ${oc.select:actor_rollout_ref.rollout.gpu_memory_utilization}
@@ -832,6 +834,21 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  vineppo:
+    _target_: verl.trainer.config.VinePPOConfig
+    mc_samples: 9
+    mc_max_new_tokens: 1024
+    mc_context_length: null
+    splitter: math
+    merge_closing_steps: false
+    min_step_tokens: 0
+    max_step_for_value_estimation: null
+    concurrency: 128
+    max_retries: 2
+    retry_delay: 1.0
+    unfinished_reward: 0.0
+    score_error_reward: 0.0
+    kl_coef: 0.0001
   norm_adv_by_std_in_grpo: true
   filter_groups:
     _target_: verl.trainer.config.FilterGroupsConfig

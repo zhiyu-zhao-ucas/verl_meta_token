@@ -180,6 +180,8 @@ class RolloutConfig(BaseConfig):
 
     prompt_length: int = 512
     response_length: int = 512
+    # Optional V1 training generation limit; evaluation keeps response_length.
+    train_response_length: Optional[int] = None
 
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5

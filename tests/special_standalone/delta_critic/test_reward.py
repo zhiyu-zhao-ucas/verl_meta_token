@@ -27,6 +27,13 @@ from examples.delta_critic.reward import compute_score
 @pytest.mark.parametrize(
     "response,gold,expected",
     [
+        (r"\boxed{23!!}", "113", 0.0),
+        (r"\boxed{23!!}", "316234143225", 1.0),
+        (r"\boxed{5!!}", "15", 1.0),
+        (r"\boxed{6!!}", "48", 1.0),
+        (r"\boxed{0!!}", "1", 1.0),
+        (r"\boxed{1!!}", "1", 1.0),
+        (r"\boxed{15}", "5!!", 1.0),
         ("Answer: 7927", "7927", 1.0),
         ("Answer: 7926", "7927", 0.0),
         (r"Answer: $\frac{1}{2}$", "0.5", 1.0),
@@ -270,3 +277,45 @@ def test_final_answer_requirement_is_opt_in_for_existing_collectors():
 def test_gold_already_delimited(gold):
     pytest.importorskip("math_verify")
     assert sampling_io.score_text(r"\boxed{2k + 2}", gold, {}) == 1.0
+
+
+@pytest.mark.parametrize("numeral", ["৮", "١", "９"])
+def test_unsupported_unicode_number_is_unparseable(numeral):
+    pytest.importorskip("math_verify")
+    sampling_io._parse_math.cache_clear()
+    response = "Answer: " + numeral
+    result = sampling_io.score_text_result(response, "2", {})
+    worker_result = asyncio.run(
+        sampling_io.score_text_results_async([response], {"gold_answer": "2"}, reward_config={})
+    )[0]
+    assert result == worker_result == sampling_io.ScoreResult(0.0, "unparseable", 1, 5)
+
+
+def test_prediction_parser_unrelated_value_error_still_fails(monkeypatch):
+    pytest.importorskip("math_verify")
+
+    def fail(*args, **kwargs):
+        raise ValueError("internal parser failure")
+
+    monkeypatch.setattr(sampling_io, "_parse_math", fail)
+    with pytest.raises(sampling_io.ScoringError, match="ValueError"):
+        sampling_io.score_text_result("Answer: 2", "2", {})
+
+
+def test_number_conversion_error_in_gold_still_fails(monkeypatch):
+    pytest.importorskip("math_verify")
+    from sympy import Number
+
+    def fail_gold(*args, **kwargs):
+        return Number("৮")
+
+    monkeypatch.setattr(sampling_io, "_parse_math_answer", fail_gold)
+    with pytest.raises(sampling_io.ScoringError, match="ValueError"):
+        sampling_io.score_text_result("Answer: 2", "2", {})
+
+
+def test_double_factorial_fix_preserves_explicit_nested_factorial():
+    from sympy import Integer, factorial
+
+    parsed = sampling_io._parse_math("$(5!)!$", "no_fallback", "first_match", 2, True)
+    assert parsed == (factorial(factorial(Integer(5), evaluate=False), evaluate=False),)

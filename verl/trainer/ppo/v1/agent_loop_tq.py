@@ -213,6 +213,17 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logprobs=config.calculate_log_probs,
         )
 
+        train_limit = config.get("train_response_length")
+        if train_limit is not None:
+            if (
+                isinstance(train_limit, bool)
+                or not isinstance(train_limit, int)
+                or not 0 < train_limit <= config.response_length
+            ):
+                raise ValueError("train_response_length must be a positive integer <= response_length")
+            if not validate:
+                sampling_params["max_tokens"] = train_limit
+
         delta_policy_settings = _online_delta_policy_settings(self.config)
         if delta_policy_settings is not None and not validate:
             sampling_params["delta_top_logprobs"] = delta_policy_settings["selection"]["top_k_logprobs"]
@@ -262,6 +273,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             config = self.config.actor_rollout_ref.rollout
             n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
             do_sample = prompt.pop("__do_sample__", True)
+            if self.config.algorithm.get("adv_estimator") == "vineppo" and not trajectory["validate"]:
+                if not do_sample or n != config.n or prompt["agent_name"] != "single_turn_agent":
+                    raise ValueError("VinePPO requires the configured single-turn sampling policy and rollout count")
 
             run_sampling_params = dict(sampling_params)
             if not trajectory["validate"] and not do_sample:
@@ -303,6 +317,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
+            if self.config.algorithm.get("adv_estimator") == "vineppo":
+                raise ValueError("VinePPO agent returned no trajectory")
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
 
@@ -315,7 +331,30 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 raise ValueError("Shared originals must be single-turn outputs from actor version zero")
             atomic_json(cache_path, {"contract": cache_contract, "output": outputs[0].model_dump(mode="json")})
 
-        await self._compute_score(outputs, kwargs=kwargs)
+        if self.config.algorithm.get("adv_estimator") == "vineppo" and not validate and len(outputs) == 1:
+            if outputs[0].extra_fields.get("finish_reason") == "length":
+                outputs[0].reward_score = self.config.algorithm.vineppo.unfinished_reward
+                outputs[0].extra_fields["reward_extra_info"] = {"acc": outputs[0].reward_score}
+        try:
+            await self._compute_score(outputs, kwargs=kwargs)
+        except Exception:
+            fallback = (
+                self.config.algorithm.vineppo.score_error_reward
+                if self.config.algorithm.get("adv_estimator") == "vineppo"
+                else None
+            )
+            if fallback is None:
+                raise
+            # Upstream grades a verifier error or timeout as an incorrect answer.
+            logger.warning(f"VinePPO verifier failed for {uid}_{session_id}; using reward {fallback}", exc_info=True)
+            outputs[-1].reward_score = float(fallback)
+            outputs[-1].extra_fields["reward_extra_info"] = {"acc": float(fallback)}
+            outputs[-1].extra_fields["vineppo_score_error"] = True
+        vineppo_fields = {}
+        if self.config.algorithm.get("adv_estimator") == "vineppo" and not validate:
+            from verl.trainer.ppo.vineppo.rollout import collect_for_worker
+
+            vineppo_fields = await collect_for_worker(self, outputs, kwargs)
 
         final_output = outputs[-1]
         # TODO: Support output:list[AgentLoopOutput]
@@ -351,6 +390,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             keys.append(f"{uid}_{session_id}_{i}")
             field = output.as_dict()
             field.update(kwargs)
+            field.update(vineppo_fields)
             expansion = self.config.algorithm.get("delta_policy", {}).get("expansion", {}) if not validate else {}
             expand_this_prompt = bool(expansion.get("enabled", False) and kwargs.get("delta_expand", False))
             # Short-response delta substitution: publish the realized outcome

@@ -95,6 +95,7 @@ class AdvantageEstimator(str, Enum):
     """
 
     GAE = "gae"
+    VINEPPO = "vineppo"
     GRPO = "grpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
@@ -148,6 +149,14 @@ def get_adv_estimator_fn(name_or_enum):
     if name not in ADV_ESTIMATOR_REGISTRY:
         raise ValueError(f"Unknown advantage estimator simply: {name}")
     return ADV_ESTIMATOR_REGISTRY[name]
+
+
+@register_adv_est(AdvantageEstimator.VINEPPO)
+def compute_vineppo_advantage(**kwargs):
+    """Compute token-level VinePPO advantages and returns."""
+    from verl.trainer.ppo.vineppo.core import compute_advantages
+
+    return compute_advantages(**kwargs)
 
 
 class AdaptiveKLController:

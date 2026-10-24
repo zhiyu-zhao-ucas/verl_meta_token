@@ -275,6 +275,10 @@ def compute_advantage(
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
 
+        if adv_estimator == AdvantageEstimator.VINEPPO:
+            for name in ("vineppo_step_ids", "vineppo_values", "vineppo_mc_counts", "vineppo_num_steps"):
+                adv_kwargs[name] = data.batch[name]
+
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages

@@ -172,6 +172,9 @@ def main(config):
     """
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
+    from verl.trainer.ppo.vineppo.config import configure_vineppo
+
+    configure_vineppo(config)
 
     # validate config
     validate_config(

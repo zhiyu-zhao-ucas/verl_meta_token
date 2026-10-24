@@ -747,6 +747,7 @@ class FSDPEngine(BaseEngine):
         scaler = getattr(self, "scaler", None)
 
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
+            tu.assign_non_tensor(micro_batch, num_micro_batches=len(micro_batches))
             sync_ctx = (
                 nullcontext()
                 if forward_only

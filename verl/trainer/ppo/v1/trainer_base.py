@@ -178,6 +178,7 @@ class PPOTrainer(ABC):
             replay_buffer_kwargs.update(
                 filter_groups_metric=filter_groups_metric,
                 sync_refill_failed_groups=sync_refill_failed_groups,
+                fail_on_generation_error=self.config.get("algorithm", {}).get("adv_estimator") == "vineppo",
             )
             if sampler_cls is ReplayBuffer:
                 filter_groups = self.config.algorithm.get("filter_groups", None)
@@ -829,7 +830,7 @@ class PPOTrainer(ABC):
         self.total_training_steps = total_training_steps
         logger.info(f"Total training steps: {self.total_training_steps}")
 
-        # The LR scheduler steps once per local update, and each global step performs
+        # By default the LR scheduler steps once per local update, and each global step performs
         # ``parameter_sync_step`` local updates (see ``PPOTrainer.step``). The optimizer's
         # schedule horizon must therefore count optimizer updates.
         optim_total_training_steps = total_training_steps * self.parameter_sync_step
@@ -837,9 +838,28 @@ class PPOTrainer(ABC):
             OmegaConf.set_struct(self.config, True)
             with open_dict(self.config):
                 if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
-                    self.config.actor_rollout_ref.actor.optim.total_training_steps = optim_total_training_steps
+                    actor_steps = optim_total_training_steps
+                    if (
+                        self.config.algorithm.adv_estimator == "vineppo"
+                        or self.config.actor_rollout_ref.actor.optim.get("step_lr_scheduler_per_minibatch", False)
+                    ):
+                        actor_steps = (
+                            total_training_steps
+                            * self.config.data.train_batch_size
+                            // self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                            * self.config.actor_rollout_ref.actor.ppo_epochs
+                        )
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = actor_steps
                 if OmegaConf.select(self.config, "critic.optim"):
-                    self.config.critic.optim.total_training_steps = optim_total_training_steps
+                    critic_steps = optim_total_training_steps
+                    if self.config.critic.optim.get("step_lr_scheduler_per_minibatch", False):
+                        critic_steps = (
+                            total_training_steps
+                            * self.config.data.train_batch_size
+                            // self.config.critic.ppo_mini_batch_size
+                            * self.config.critic.ppo_epochs
+                        )
+                    self.config.critic.optim.total_training_steps = critic_steps
         except Exception as e:
             logger.warning(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
@@ -960,6 +980,8 @@ class PPOTrainer(ABC):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
+            if self.config.get("algorithm", {}).get("adv_estimator") == "vineppo":
+                raise FileNotFoundError(f"VinePPO resume requires dataloader state: {dataloader_local_path}")
             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
         # 5. restore TransferQueue state (async modes). Re-issuing the restored in-flight prompts is
@@ -1062,6 +1084,8 @@ class PPOTrainer(ABC):
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+        if self.config.get("algorithm", {}).get("adv_estimator") == "vineppo":
+            OmegaConf.save(self.config, os.path.join(local_global_step_folder, "vineppo_config.yaml"), resolve=True)
 
         # save TransferQueue state for async modes so in-flight prompts (already fetched from the
         # dataloader but not yet trained into this checkpoint's weights) survive a restart:
@@ -1116,6 +1140,7 @@ class PPOTrainer(ABC):
         session_to_sample_idx: dict[str, int] = {}
         # To avoid failure sessions
         expected_acc_counts: dict[tuple[str, str], int] = {}
+        is_vineppo = self.config.get("algorithm", {}).get("adv_estimator") == "vineppo"
 
         for batch_dict in self.val_dataloader:
             # 1. put batch to agent loop manager
@@ -1202,6 +1227,11 @@ class PPOTrainer(ABC):
                     reward_extra_info = (
                         extra_field.get("reward_extra_info", {}) if isinstance(extra_field, dict) else {}
                     )
+                    if is_vineppo:
+                        # A verifier error was graded with score_error_reward; keep it visible per sample.
+                        reward_extra_info = reward_extra_info | {
+                            "score_error": float(bool(extra_field.get("vineppo_score_error", False)))
+                        }
                     for key in reward_extra_infos_dict:
                         if key != "reward" and key not in reward_extra_info:
                             reward_extra_infos_dict[key].append(None)
@@ -1991,12 +2021,56 @@ class PPOTrainer(ABC):
             return self._compute_delta_policy_advantage(batch, metrics)
 
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        is_vineppo = self.config.get("algorithm", {}).get("adv_estimator") == "vineppo"
+        if is_vineppo:
+            if any(tag.get("is_padding", False) for tag in batch.tags):
+                raise ValueError("VinePPO does not allow synthetic padding trajectories")
+            fields.extend(
+                [
+                    "vineppo_step_ids",
+                    "vineppo_values",
+                    "vineppo_mc_counts",
+                    "vineppo_num_steps",
+                    "vineppo_actor_version",
+                    "vineppo_generated_tokens",
+                    "vineppo_mc_variance",
+                    "vineppo_mc_truncated",
+                    "vineppo_main_truncated",
+                    "vineppo_split_fallback",
+                    "vineppo_noncanonical",
+                    "vineppo_main_score_error",
+                    "vineppo_mc_score_errors",
+                    "vineppo_mc_seconds",
+                    "vineppo_score_seconds",
+                ]
+            )
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         response_mask = data["response_mask"]
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+        if is_vineppo:
+            if not torch.all(data.batch["vineppo_actor_version"] == self.global_steps - 1):
+                raise ValueError("VinePPO received trajectories from a different actor version")
+            metrics["vineppo/steps_mean"] = data.batch["vineppo_num_steps"].float().mean().item()
+            metrics["vineppo/mc_samples"] = data.batch["vineppo_mc_counts"].sum().item()
+            metrics["vineppo/mc_generated_tokens"] = data.batch["vineppo_generated_tokens"].sum().item()
+            metrics["vineppo/mc_completion_rate"] = 1.0  # Incomplete batches raise before this point.
+            metrics["vineppo/mc_truncation_rate"] = (
+                data.batch["vineppo_mc_truncated"].sum().item() / metrics["vineppo/mc_samples"]
+            )
+            metrics["vineppo/main_truncation_rate"] = data.batch["vineppo_main_truncated"].float().mean().item()
+            metrics["vineppo/split_fallback_rate"] = data.batch["vineppo_split_fallback"].float().mean().item()
+            metrics["vineppo/noncanonical_rate"] = data.batch["vineppo_noncanonical"].float().mean().item()
+            metrics["vineppo/main_score_error_rate"] = data.batch["vineppo_main_score_error"].float().mean().item()
+            metrics["vineppo/mc_score_error_rate"] = (
+                data.batch["vineppo_mc_score_errors"].sum().item() / metrics["vineppo/mc_samples"]
+            )
+            sampled_states = data.batch["vineppo_mc_counts"] > 0
+            metrics["vineppo/mc_reward_variance"] = data.batch["vineppo_mc_variance"][sampled_states].mean().item()
+            metrics["vineppo/mc_seconds_mean"] = data.batch["vineppo_mc_seconds"].mean().item()
+            metrics["vineppo/score_seconds_sum"] = data.batch["vineppo_score_seconds"].sum().item()
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -2495,6 +2569,7 @@ class PPOTrainer(ABC):
         ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         extra_info = {
+            "scheduler_per_minibatch": self.config.critic.optim.get("step_lr_scheduler_per_minibatch", False),
             "global_batch_size": ppo_mini_batch_size,
             "mini_batch_size": ppo_mini_batch_size,
             "epochs": self.config.critic.ppo_epochs,
@@ -2554,6 +2629,10 @@ class PPOTrainer(ABC):
         if self.delta_policy_config is not None:
             extra_info["delta_policy_config"] = self.delta_policy_config.as_dict()
             extra_info["delta_policy_reference_policy_id"] = self.delta_policy_settings["reference_policy_id"]
+        extra_info["scheduler_per_minibatch"] = (
+            self.config.algorithm.adv_estimator == "vineppo"
+            or self.config.actor_rollout_ref.actor.optim.get("step_lr_scheduler_per_minibatch", False)
+        )
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)

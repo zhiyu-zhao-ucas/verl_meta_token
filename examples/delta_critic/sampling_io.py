@@ -229,6 +229,16 @@ def _parse_math(
 ):
     from math_verify import parse
 
+    # latex2sympy2_extended reads n!! as factorial(factorial(n)), not factorial2(n).
+    # Normalize standalone nonnegative integer double factorials exactly before parsing.
+    # Bound the calculation; preserve explicit nested factorials and other expressions.
+    double_factorial = re.fullmatch(r"\s*(\$?)\s*([0-9]{1,4})\s*!!\s*\1\s*", text)
+    if double_factorial and (n := int(double_factorial.group(2))) <= 1000:
+        value = 1
+        for factor in range(n, 0, -2):
+            value *= factor
+        text = f"${value}$"
+
     return tuple(
         parse(
             text,
@@ -341,6 +351,21 @@ def _score_math_once(
         # In particular, SymPy rejects decimal integers beyond Python's
         # configured digit limit. Gold parsing and verify failures remain
         # fail-closed below and are never converted into wrong answers.
+        return 0.0, "unparseable"
+    except ValueError as exc:
+        # math-verify's Unicode digit regex can extract a numeral that SymPy
+        # Number cannot construct (e.g. Bengali ৮). Only this prediction-side
+        # conversion error is an unparseable answer; unrelated errors propagate.
+        traceback = exc.__traceback__
+        while traceback is not None and traceback.tb_next is not None:
+            traceback = traceback.tb_next
+        is_number_conversion = (
+            traceback is not None
+            and traceback.tb_frame.f_globals.get("__name__") == "sympy.core.numbers"
+            and re.fullmatch(r'String ".*" does not denote a Number', str(exc), flags=re.DOTALL)
+        )
+        if not is_number_conversion:
+            raise
         return 0.0, "unparseable"
     if not prediction:
         return 0.0, "unparseable"

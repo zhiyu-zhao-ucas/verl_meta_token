@@ -63,7 +63,18 @@ def _make_trainer(tmp_path, events, async_save=False):
     dataloader = MagicMock()
     dataloader.state_dict.return_value = {}
     trainer.train_dataloader = dataloader
+    # This fixture bypasses __init__; initialize its optional policy-extension state.
+    trainer.delta_policy_settings = None
     return trainer
+
+
+def test_vineppo_save_records_resolved_config(tmp_path):
+    trainer = _make_trainer(tmp_path, [])
+    trainer.config.algorithm = {"adv_estimator": "vineppo"}
+    trainer._save_checkpoint()
+    saved = OmegaConf.load(tmp_path / "global_step_3" / "vineppo_config.yaml")
+    assert saved.algorithm.adv_estimator == "vineppo"
+    assert (tmp_path / "global_step_3" / "data.pt").exists()
 
 
 def test_save_fires_on_save_after_worker_save(tmp_path):
